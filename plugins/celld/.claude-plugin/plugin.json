@@ -1,0 +1,9 @@
+{
+  "name": "celld",
+  "description": "Working with celld — Deno's self-hosted, distributed Durable Objects daemon: writing and deploying Cloudflare Workers apps to a celld fleet, the celld CLI, fleet operations, and celld's durability guarantees.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Violet Buse",
+    "email": "violet@git.violetbuse.com"
+  }
+}
