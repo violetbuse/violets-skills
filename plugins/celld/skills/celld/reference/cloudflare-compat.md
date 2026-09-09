@@ -124,8 +124,12 @@ navigation flags. Every other flag is accepted without effect;
   `compatibility_date`, `compatibility_flags`, `durable_objects`, `migrations`,
   `assets`, `services`, `triggers`, `vars`, `d1_databases`, `kv_namespaces`,
   `queues`, `workflows`, `r2_buckets`.
-- **Any other top-level key — including `routes` — stops the deploy.** Configure
-  routing in your ingress.
+- **Any other top-level key — including `routes` and `rules` — stops the
+  deploy.** Configure routing in your ingress. There is no equivalent of
+  wrangler's module `rules`: the bundler runs esbuild with only
+  `--loader:.wasm=copy`, so non-JS imports (`.sql`/`.txt` as Text modules, etc.)
+  aren't supported — inline that content into JS before deploying. This bites
+  drizzle's `durable-sqlite` migration bundle; see the `drizzle-orm` skill.
 - An asset-only project can omit `main`. celld refuses a symlink / special file
   / non-UTF-8 name / path > 1024 bytes / path that changes under
   percent-decoding / a `_worker.js` entry in an asset dir.
