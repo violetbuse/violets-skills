@@ -38,6 +38,15 @@ So:
   against real upstream source. Pin them to a released tag and state that
   version in the skill (e.g. the `celld` skill tracks celld **v0.4.1**,
   `vendor/celld`). Re-verify version-sensitive claims when bumping.
+- When upstream has no tags (a live docs site), pin to a dated commit and say so
+  in the skill. The `drizzle-orm` skill tracks **`drizzle-orm` 0.45.2**
+  (`vendor/drizzle-orm`) and **`drizzle-orm-docs` @ `11695b7`** (2025-11-19, the
+  last commit before the repo started merging v1 content) — chosen so both
+  checkouts describe the same stable release, not the v1 RC.
+- The `planetscale-postgres-serverless` skill tracks **`@neondatabase/serverless`
+  v1.1.0** (`vendor/neon-serverless`); its `CONFIG.md` is slightly stale, so
+  verify `neonConfig` defaults against `src/shims/net/index.ts`
+  (`Socket.defaults`).
 
 ## Working with submodules
 

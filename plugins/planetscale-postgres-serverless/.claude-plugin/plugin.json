@@ -1,0 +1,9 @@
+{
+  "name": "planetscale-postgres-serverless",
+  "description": "Connecting to PlanetScale Postgres from serverless and edge runtimes with the Neon serverless driver (@neondatabase/serverless) — HTTP and WebSocket modes, the required neonConfig (fetchEndpoint, wsProxy, pipelineConnect), connection strings, transaction support, framework setup (Cloudflare Workers, Vercel, Deno, Netlify), ORM integration, and when to use pg + PSBouncer instead.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Violet Buse",
+    "email": "violet@git.violetbuse.com"
+  }
+}

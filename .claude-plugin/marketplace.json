@@ -14,6 +14,18 @@
       "source": "./plugins/celld",
       "description": "Working with celld — Deno's self-hosted, distributed Durable Objects daemon: writing and deploying Cloudflare Workers apps to a celld fleet, the celld CLI, fleet operations, and celld's durability guarantees.",
       "version": "0.1.0"
+    },
+    {
+      "name": "drizzle-orm",
+      "source": "./plugins/drizzle-orm",
+      "description": "Working with Drizzle ORM and Drizzle Kit — TypeScript schema declaration, the SQL-like and relational query APIs, migrations (generate/migrate/push/pull), driver setup, serverless performance, and the type/mapping pitfalls that bite in production.",
+      "version": "0.1.0"
+    },
+    {
+      "name": "planetscale-postgres-serverless",
+      "source": "./plugins/planetscale-postgres-serverless",
+      "description": "Connecting to PlanetScale Postgres from serverless/edge runtimes with the Neon serverless driver (@neondatabase/serverless) — HTTP vs WebSocket mode, the required neonConfig (fetchEndpoint, wsProxy, pipelineConnect), connection strings, framework setup, ORM integration, and when to use pg + PSBouncer instead.",
+      "version": "0.1.0"
     }
   ]
 }
