@@ -63,6 +63,28 @@ open); one that reaches no safe point within `CELLD_DEPLOY_MAX_AGE_S` (60,
 so **adjacent versions must accept each other's calls**. Storage, epoch, and
 hibernatable WebSockets are kept; the move touches no bucket.
 
+## Worker vars and secrets
+
+celld has no encrypted secret store (no `wrangler secret`, no `.dev.vars`).
+Worker vars (`plain_text` bindings, read as `env.NAME`) resolve on each node at
+deployment-build time from three sources, later wins:
+
+1. `vars` in `wrangler.json` — string values only; become `plain_text` bindings
+   in `deploy/<name>/<version>/manifest.json`.
+2. `CELLD_VARS_FILE` — dotenv-style file on the node: `NAME=value` per line,
+   `#` comments and blank lines skipped, one surrounding `'`/`"` pair stripped,
+   no escapes or multi-line values.
+3. `CELLD_VAR_<NAME>` env vars on the node.
+
+`celld deploy` uploads the manifest to the bucket **unencrypted**, and past
+versions are immutable — so anything in `wrangler.json` `vars` is readable by
+any bucket reader forever. To pass a secret without writing it to the bucket,
+keep it out of `vars` and set it per node via `CELLD_VARS_FILE` / `CELLD_VAR_*`;
+those are never uploaded. Deliver the file/env to **every** node out of band
+(systemd `EnvironmentFile=`, mounted secret, config manager) — a var on only
+some nodes makes behaviour depend on which node served the request. Edit the
+file and `POST /reload` (rebuilds unchanged code) to apply with no restart.
+
 ## Ownership balancing
 
 - Every node reads a shared fleet sample every 5 s
@@ -240,8 +262,9 @@ variable takes its documented default.
 disables), `CELLD_ASSET_CACHE_DIR`, `CELLD_ASSET_CACHE_BYTES` (512 MiB).
 
 **Deploy / lease:** `CELLD_DEPLOY_POLL_S` (30), `CELLD_DEPLOY_MAX_AGE_S` (60),
-`CELLD_TTL_MS` (10000), `CELLD_VARS_FILE` / `CELLD_VAR_*` (Worker var
-overrides), `CELLD_STORAGE_PROBE` (`0` skips startup storage test).
+`CELLD_TTL_MS` (10000), `CELLD_VARS_FILE` / `CELLD_VAR_*` (per-node Worker var
+overrides, never uploaded to the bucket — see *Worker vars and secrets*),
+`CELLD_STORAGE_PROBE` (`0` skips startup storage test).
 
 **Recovery / shutdown:** `CELLD_RECOVERY_RETRY_MS` (1000),
 `CELLD_RECOVERY_RETRIES` (240), `CELLD_RELEASES` (128),
