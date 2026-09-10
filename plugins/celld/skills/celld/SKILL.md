@@ -8,7 +8,8 @@ description: >-
   writing or deploying a Worker/Durable Object app to celld, running or
   operating a celld fleet, using the `celld` CLI (`dev`, `deploy`, `diagnose`,
   `cell`, `d1`, `kv`, `queue`), choosing bucket storage, tuning `CELLD_*`
-  environment variables, planning a version upgrade, or reasoning about celld's
+  environment variables, passing secrets or Worker vars without writing them to
+  the bucket, planning a version upgrade, or reasoning about celld's
   one-writer / RPO=0 durability guarantees.
 ---
 
@@ -273,6 +274,46 @@ Example projects (`examples/<name>/` in the celld repo): `hello` (stateless fetc
   (`CELLD_MAX_CELL_REQUESTS`); excess gets HTTP 503 + `Retry-After: 1` +
   `X-Celld-Overload: cell`.
 
+## Secrets and Worker vars
+
+celld has **no encrypted secret store** — nothing like `wrangler secret put`,
+and it does **not** read `.dev.vars`. Configuration values reach the Worker as
+**vars** (`plain_text` bindings, read as `env.NAME`), resolved on each node when
+it builds a deployment. Three sources, later wins:
+
+1. **`vars` in `wrangler.json`** — each entry becomes a `plain_text` binding
+   baked into the deployment manifest. celld requires every value to be a
+   **string** (no JSON/object vars).
+2. **`CELLD_VARS_FILE`** — path, on the node, to a dotenv-style file: `NAME=value`
+   per line; blank lines and `#` comments ignored; one surrounding pair of `'` or
+   `"` stripped; no escapes, no multi-line values.
+3. **`CELLD_VAR_<NAME>`** env vars on the node — `CELLD_VAR_API_KEY` sets binding
+   `API_KEY`.
+
+**The manifest is written to the bucket in the clear.** `celld deploy` uploads
+`deploy/<name>/<version>/manifest.json` to your S3/GCS/Azure bucket, so every
+value in `wrangler.json` `vars` lands there unencrypted — and stays, because old
+deployment versions are immutable. Anyone with bucket read access can read them.
+
+**To pass a secret without pushing it to the bucket:** keep it out of `vars` and
+supply it on each node through `CELLD_VARS_FILE` (or `CELLD_VAR_*`). Those are
+read locally at build time and never uploaded. The Worker still reads it as
+`env.SECRET_NAME`, exactly like any other var.
+
+- Resolution is **per node**. Every node in the fleet needs the same file/env,
+  delivered out of band (systemd `EnvironmentFile=`, a mounted secret, your
+  config manager). A var present on only some nodes makes requests behave
+  differently depending on which node served them.
+- Declaring the name in `wrangler.json` `vars` with an empty or placeholder
+  value is fine — a node-level source overrides it — and keeps the binding
+  visible and type-checked. That placeholder still goes to the bucket, so never
+  make it a usable fallback secret.
+- Editing `CELLD_VARS_FILE` then `POST /reload` (or waiting for the 30 s poll)
+  applies new values with **no restart** — `/reload` rebuilds even when the code
+  is unchanged.
+- `celld dev` reads `vars` from `wrangler.json` and also honors
+  `CELLD_VARS_FILE` / `CELLD_VAR_*` from its own environment.
+
 ## Bucket storage
 
 celld needs conditional writes (create-if-absent and compare-and-swap), exact
@@ -321,5 +362,9 @@ to a collector instead. Reads W3C `traceparent`. Details + DuckDB queries in
   configure routing in your ingress.
 - **Bucket credentials = full fleet control.** Scope each credential to one
   fleet bucket.
+- **`wrangler.json` `vars` go to the bucket in the clear** and stay in every
+  past deployment version. celld has no secret store — pass secrets per node via
+  `CELLD_VARS_FILE` / `CELLD_VAR_*`, which never leave the machine. See
+  *Secrets and Worker vars*.
 - celld is **alpha**: pin `CELLD_VERSION`, keep operator tooling and binary on
   the same release, expect `CELLD_*` defaults to shift.
