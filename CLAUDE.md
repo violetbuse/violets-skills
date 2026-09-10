@@ -26,6 +26,23 @@ When adding or renaming a skill, keep these in sync:
 - `SKILL.md` frontmatter `name` (matches the skill directory) and `description`
 - the plugin table in `README.md`
 
+## Bump the version on every change to a plugin
+
+`/plugin update` only pulls a new version when the manifest version is higher —
+editing `SKILL.md` or a `reference/*.md` file without bumping means installed
+copies never see the change. So **every commit that touches anything under
+`plugins/<name>/` must bump that plugin's version**, in BOTH places (they must
+match):
+- `plugins/<name>/.claude-plugin/plugin.json` `version`
+- the matching `plugins[]` entry in `.claude-plugin/marketplace.json`
+
+Also bump the marketplace's own `metadata.version` in `marketplace.json` whenever
+any plugin version changes.
+
+Semver, starting from `0.1.0`: patch for content fixes/additions, minor for a
+substantive rewrite or new reference file, major for a breaking reorganization.
+Do this in the same commit as the content change, not a follow-up.
+
 ## Critical constraint: skills must be self-contained
 
 A plugin ships only its `source` directory (`plugins/<name>/`). Anything under
