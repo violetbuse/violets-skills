@@ -83,7 +83,11 @@ prefixes later.)
 A gate holds each write response until a durability proof covers the write. A
 read-only response waits the same way when the object has an uncovered
 committed write; an error answer waits too (a thrown handler's message can
-carry a value it read); a streaming body gets the rule per chunk.
+carry a value it read); a streaming body gets the rule per chunk. The gate's
+scope widened in v0.5.0: an R2 mutation now waits for its **source** object's
+write proof (so it can't change the application bucket before that write is
+durable), and a raw TCP connect, write, TLS upgrade, or socket shutdown waits
+on the same proof too.
 
 - **Bucket proof:** after the upload, celld reads the ownership record once and
   acks only if it still names this node at this epoch. A partitioned node
@@ -112,9 +116,13 @@ before reading the bucket: absent ⇒ the session never acked past the bucket;
 sealed ⇒ recovery completed; open/recovering ⇒ the activation runs recovery
 (fence the record with CAS, seal reachable followers, upload retained
 segments/bundles into per-cell prefixes, mark sealed) and cannot restore until
-that finishes. A large dead node can hold recovery open for minutes; waiting
-requests retry with backoff (`CELLD_RECOVERY_RETRY_MS` default 1000) and fail
-only after the budget (`CELLD_RECOVERY_RETRIES` default 240). Restarting nodes
+that finishes. A large dead node can hold recovery open for minutes — recovery
+reads the retained bundles in ≤512 MiB windows, uploading and releasing each
+window's rows before reading the next, so its memory doesn't grow with the
+session size (a cell with rows spread across several windows gets one output
+object per window). Waiting requests retry with backoff
+(`CELLD_RECOVERY_RETRY_MS` default 1000) and fail only after the budget
+(`CELLD_RECOVERY_RETRIES` default 240). Restarting nodes
 serve authenticated follower seal/tail requests before finishing their own
 predecessor recovery, so nodes that restart together can still recover.
 
@@ -165,6 +173,17 @@ cell, fails every uncompleted request, writes nothing to the bucket, logs a
 dead/replaced and acquire the cells through the ownership records. The fenced
 state is terminal — only a restart returns the node, via the same
 cold-activation path a peer failure uses.
+
+An ingress node (one proxying a request to a remote owner) rechecks a cached
+remote route against its own observed lease deadline on each new request —
+not just when it fails — so it re-resolves ownership at the deadline even if
+the stale owner keeps its connections open without answering. A **draining**
+ingress can still resolve and forward to a live remote owner, but refuses to
+grant new ownership of an unowned cell or one whose owner's lease expired. A
+request already in flight to the previous owner is not replayed on a
+re-resolve — the handler could have committed a write before the connection
+broke — so the caller must be prepared to cancel and retry such a request
+itself.
 
 Log events: `node_lease_watchdog_fence` (expired), `node_lease_record_missing_fence`,
 `node_lease_record_mismatch_fence`. `RUST_LOG=celld=info,store=debug` adds

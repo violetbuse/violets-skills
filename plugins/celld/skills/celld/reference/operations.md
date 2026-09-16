@@ -106,6 +106,17 @@ file and `POST /reload` (rebuilds unchanged code) to apply with no restart.
   close 1012 so clients reconnect. A **resident** cell moves only after idle
   eviction (`CELLD_IDLE_EVICT_S`) hibernates it — so a fleet without idle
   eviction balances only cells that hibernate on their own.
+- **Idle eviction is revocable (since v0.5.0).** The node proves the cell
+  durable, then stops its runtime, then writes a handoff snapshot — a request
+  that arrives before the runtime stops cancels the eviction outright (cell
+  keeps its runtime and epoch); one that arrives after the stop but before the
+  handoff snapshot is written still gets the cell back at the *same* epoch
+  (nothing durable has been published yet); only after that snapshot write
+  does a new request wait for the cell to restart at a new epoch. A bucket
+  proof makes the first (pre-stop) window longer than a fleet proof does. If
+  the runtime doesn't stop within `CELLD_OPERATION_DEADLINE_MS`, the node
+  keeps the cell resident and waits one more idle period before retrying —
+  same wait after a revoked eviction gives the cell back.
 - A draining node, and a node with a cold-activation backlog (`restoring` in
   its lease), receives no cells. The fleet moves nothing while any lease lacks
   a weight, so a rolling upgrade to a weight-aware version completes first.
@@ -142,7 +153,12 @@ celld does not scale itself. Two surfaces feed an external autoscaler:
   `resident_cells`, `host_websockets`, `rss_bytes`, `in_use_bytes`,
   `cpu_percent_x100`, `open_fds`, `pressured`, `memory_headroom`, `shed_cells`,
   `restoring`, `sampled_ms`. Readable with the bucket credentials alone.
-- **`GET /state`** on the internal listener — the live counters above.
+- **`GET /state`** on the internal listener — the live counters above, plus
+  (since v0.5.0) `remote_route_refreshes`: cached owner/capacity routes that
+  expired and triggered a fresh lookup. It rises during normal lease renewal
+  too (not just failures), so treat a spike relative to baseline, not the
+  absolute count, as the signal; an adoption with no prior lease and an
+  explicit invalidation don't count toward it.
 
 `capacity_waiting > 0` (or a `pressured` lease) is the direct "add a node"
 signal. Scale down only when every remaining node reports `memory_headroom` and
@@ -356,6 +372,12 @@ temporary files in the cell's local LTX directory for an oversized source.
 `0` disables), `RUST_LOG` (default `info`). `CELLD_LOG_CAPTURE_WORKERS` (fixed
 at 8), `CELLD_LOG_GROUP_COMMIT_MS` (fixed at 1 ms), and
 `CELLD_QUEUE_PRODUCER_GROUP_MS` (fixed at 4 ms) are **removed**.
+`CELLD_LOG_BUNDLE` is also **removed** — fleet durability now always tiers
+multiple cells' changes into shared bucket objects (a node falls back to
+per-cell uploads only when the bucket itself must prove a write); this is
+transparent to `CELLD_DURABILITY=bucket`, which still needs its own bucket
+proof per acknowledged write, and recovery reads both old per-cell objects and
+the new bundles.
 
 **Alarms / timers:** `CELLD_ALARM_RESIDENT_MS`, `CELLD_WAKER_TICK_MS`,
 `CELLD_FETCH_TIMEOUT_S`, `CELLD_HANDLER_BUDGET_S`, `CELLD_TOKIO_THREADS`.
