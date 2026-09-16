@@ -1,6 +1,6 @@
 # celld architecture & guarantees
 
-Distilled from celld v0.4.1: `docs/guarantees.md`, `docs/README.md`,
+Distilled from celld v0.5.0: `docs/guarantees.md`, `docs/README.md`,
 `docs/testing.md`, and `crates/celld/protocol.rs` in
 <https://github.com/denoland/celld> (fetch those files for the primary text).
 
@@ -46,8 +46,10 @@ serves, then requests part of a second object and verifies the range and bytes.
 Startup test makes ≤3 attempts on an unclear failure (starts with a warning if
 all fail — a transient outage can clear), but stops immediately on an
 unsupported conditional write / ranged read or a store that ignores a
-condition or returns wrong bytes. `CELLD_STORAGE_PROBE=0` disables it; or run
-`celld diagnose --read-only` with a non-writing credential.
+condition or returns wrong bytes. This startup test is mandatory since v0.5.0
+— `CELLD_STORAGE_PROBE` (the old opt-out) is removed and rejected at startup;
+run `celld diagnose --read-only` with a non-writing credential to probe
+on demand instead.
 
 ## The supervisor
 
@@ -81,7 +83,11 @@ prefixes later.)
 A gate holds each write response until a durability proof covers the write. A
 read-only response waits the same way when the object has an uncovered
 committed write; an error answer waits too (a thrown handler's message can
-carry a value it read); a streaming body gets the rule per chunk.
+carry a value it read); a streaming body gets the rule per chunk. The gate's
+scope widened in v0.5.0: an R2 mutation now waits for its **source** object's
+write proof (so it can't change the application bucket before that write is
+durable), and a raw TCP connect, write, TLS upgrade, or socket shutdown waits
+on the same proof too.
 
 - **Bucket proof:** after the upload, celld reads the ownership record once and
   acks only if it still names this node at this epoch. A partitioned node
@@ -110,9 +116,13 @@ before reading the bucket: absent ⇒ the session never acked past the bucket;
 sealed ⇒ recovery completed; open/recovering ⇒ the activation runs recovery
 (fence the record with CAS, seal reachable followers, upload retained
 segments/bundles into per-cell prefixes, mark sealed) and cannot restore until
-that finishes. A large dead node can hold recovery open for minutes; waiting
-requests retry with backoff (`CELLD_RECOVERY_RETRY_MS` default 1000) and fail
-only after the budget (`CELLD_RECOVERY_RETRIES` default 240). Restarting nodes
+that finishes. A large dead node can hold recovery open for minutes — recovery
+reads the retained bundles in ≤512 MiB windows, uploading and releasing each
+window's rows before reading the next, so its memory doesn't grow with the
+session size (a cell with rows spread across several windows gets one output
+object per window). Waiting requests retry with backoff
+(`CELLD_RECOVERY_RETRY_MS` default 1000) and fail only after the budget
+(`CELLD_RECOVERY_RETRIES` default 240). Restarting nodes
 serve authenticated follower seal/tail requests before finishing their own
 predecessor recovery, so nodes that restart together can still recover.
 
@@ -133,6 +143,24 @@ downloading the whole chain. The file then fills in the background at
 chain is cloned whole. A paged cell's local file is a cache — not preserved as
 an eviction snapshot, not used for a handoff snapshot.
 
+### Alarm discovery (wake format 2, since v0.5.0)
+
+SQLite alone holds the alarm deadline, consumption, retry state, and
+installation identity — a wake-format record is only a **hint** that makes
+celld read that SQLite state; it never authorizes a handler to run on its own.
+Each committed alarm installation gets its own conditionally-written object
+under `wake/entries/`, keyed by ownership epoch + a persistent SQLite
+sequence, so an update within the same minute still needs a fresh publication
+PUT and an old installation's identity can't collide with a newer one.
+Retirement publishes a proof-backed record under `wake/retired/` — requiring a
+durability proof, the current owner, and (if an alarm is still armed) a
+confirmed replacement publication — instead of a conditional delete, which the
+bucket contract doesn't offer. This is a **breaking bucket-layout change from
+v0.4.1**: the format is versioned (`wake/format.json` selects format 2), an
+unsupported format blocks startup, and a v0.4.1 node cannot read it — see the
+v0.4.1→v0.5.0 upgrade procedure in `reference/operations.md`, which needs a
+full fleet stop, not a rolling restart.
+
 ### Self-fencing
 
 Each node holds a bucket lease with an expiry, renewed after ⅓ of the lifetime
@@ -145,6 +173,17 @@ cell, fails every uncompleted request, writes nothing to the bucket, logs a
 dead/replaced and acquire the cells through the ownership records. The fenced
 state is terminal — only a restart returns the node, via the same
 cold-activation path a peer failure uses.
+
+An ingress node (one proxying a request to a remote owner) rechecks a cached
+remote route against its own observed lease deadline on each new request —
+not just when it fails — so it re-resolves ownership at the deadline even if
+the stale owner keeps its connections open without answering. A **draining**
+ingress can still resolve and forward to a live remote owner, but refuses to
+grant new ownership of an unowned cell or one whose owner's lease expired. A
+request already in flight to the previous owner is not replayed on a
+re-resolve — the handler could have committed a write before the connection
+broke — so the caller must be prepared to cancel and retry such a request
+itself.
 
 Log events: `node_lease_watchdog_fence` (expired), `node_lease_record_missing_fence`,
 `node_lease_record_mismatch_fence`. `RUST_LOG=celld=info,store=debug` adds
@@ -160,12 +199,17 @@ and celld — "these objects are the interface; nothing else is exchanged":
   `script_name`, `main_module` (absent for asset-only), `do_classes`,
   `sqlite_classes`, `modules` (each `ModuleRef` carries a full SHA-256; a
   legacy 16-char prefix digest is also accepted), `assets`, `crons`,
-  `queue_consumers`, `required_features`, and `raw_metadata` (wrangler's raw
-  metadata verbatim).
+  `queue_consumers`, `containers` (each spec's class, image id, and instance
+  shape; `deploy/images/<id>.tar` holds the tar), `fence_image` (the
+  `celld-fence` image built alongside a deployment with containers — `None`
+  otherwise, and on a deployment from a celld that predates it, which then
+  refuses to start containers), `required_features`, and `raw_metadata`
+  (wrangler's raw metadata verbatim).
 - `required_features` gate — a node rejects a manifest needing a feature it
   doesn't support, up front (not at request time). Values:
-  `assets-v1`, `cron-v1`, `d1-v1`, `kv-v1`, `queues-v1`, `sqlite-vec-v1`,
-  `r2-v1`, `wasm-v1`, `workflows-v1`.
+  `assets-v1`, `containers-v1`, `cron-v1`, `d1-v1`, `kv-v1`, `queues-v1`,
+  `sqlite-vec-v1`, `r2-v1`, `wasm-v1`, `workflows-v1`. A `worker_loaders`
+  declaration needs no feature flag — Dynamic Workers is no longer gated.
 - `DeployPointer` — `deploy/current.json`: `{ script_name?, version, prefix,
   rollout: { percent } }`. Changing it *is* a deploy; nodes converge to it.
 - `QueueConsumerAttachment` — `deploy/queues/<queue>/consumer.json`: the one
