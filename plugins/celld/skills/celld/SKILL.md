@@ -327,42 +327,34 @@ the shared node sample, so two nodes starting at once can briefly exceed it.
 celld has **no encrypted secret store** — nothing like `wrangler secret put`.
 `celld dev` reads a local `.dev.vars` file for convenience (see *Develop
 locally*), but a deployed fleet has no equivalent — `celld deploy` never reads
-it. Configuration values reach the Worker as
-**vars** (`plain_text` bindings, read as `env.NAME`), resolved on each node when
-it builds a deployment. Three sources, later wins:
-
-1. **`vars` in `wrangler.json`** — each entry becomes a `plain_text` binding
-   baked into the deployment manifest. celld requires every value to be a
-   **string** (no JSON/object vars).
-2. **`CELLD_VARS_FILE`** — path, on the node, to a dotenv-style file: `NAME=value`
-   per line; blank lines and `#` comments ignored; one surrounding pair of `'` or
-   `"` stripped; no escapes, no multi-line values.
-3. **`CELLD_VAR_<NAME>`** env vars on the node — `CELLD_VAR_API_KEY` sets binding
-   `API_KEY`.
+it. A deployed Worker's **vars** (`plain_text` bindings, read as `env.NAME`)
+come from exactly one source, resolved on each node when it builds a
+deployment: **`vars` in `wrangler.json`**, each entry baked into the
+deployment manifest as a `plain_text` binding. celld requires every value to
+be a **string** (no JSON/object vars).
 
 **The manifest is written to the bucket in the clear.** `celld deploy` uploads
 `deploy/<name>/<version>/manifest.json` to your S3/GCS/Azure bucket, so every
 value in `wrangler.json` `vars` lands there unencrypted — and stays, because old
 deployment versions are immutable. Anyone with bucket read access can read them.
 
-**To pass a secret without pushing it to the bucket:** keep it out of `vars` and
-supply it on each node through `CELLD_VARS_FILE` (or `CELLD_VAR_*`). Those are
-read locally at build time and never uploaded. The Worker still reads it as
-`env.SECRET_NAME`, exactly like any other var.
+**There is currently no way to keep a value out of the bucket for a deployed
+fleet.** Through v0.4.1, a `CELLD_VARS_FILE` path and `CELLD_VAR_<NAME>` env
+vars let you set per-node overrides, read locally at build time and never
+uploaded — this skill used to point to them as the answer. **v0.5.0 removed
+both.** celld now refuses to start if either is set (`crates/celld/env_vars.rs`
+`REMOVED`/`REMOVED_PREFIX`), with the message "set `vars` in the Wrangler
+config, or `.dev.vars` for `celld dev`" — but `.dev.vars` only feeds `celld
+dev`; `celld deploy`'s `Options.vars` doc comment is explicit that `celld
+deploy` supplies none, "so a local credential cannot reach a fleet."
 
-- Resolution is **per node**. Every node in the fleet needs the same file/env,
-  delivered out of band (systemd `EnvironmentFile=`, a mounted secret, your
-  config manager). A var present on only some nodes makes requests behave
-  differently depending on which node served them.
+- To keep a real secret out of the bucket, don't put it in a Worker var at
+  all: fetch it at request time from an external secret manager/KMS your
+  Worker code calls, or terminate it at your ingress/proxy instead of handing
+  it to the Worker.
 - Declaring the name in `wrangler.json` `vars` with an empty or placeholder
-  value is fine — a node-level source overrides it — and keeps the binding
-  visible and type-checked. That placeholder still goes to the bucket, so never
-  make it a usable fallback secret.
-- Editing `CELLD_VARS_FILE` then `POST /reload` (or waiting for the 30 s poll)
-  applies new values with **no restart** — `/reload` rebuilds even when the code
-  is unchanged.
-- `celld dev` reads `vars` from `wrangler.json` and also honors
-  `CELLD_VARS_FILE` / `CELLD_VAR_*` from its own environment.
+  value still goes to the bucket like any other value — it is not a safe
+  fallback secret.
 
 ## Bucket storage
 
@@ -417,8 +409,8 @@ sink switch. Reads W3C `traceparent`. Details + DuckDB queries in
 - **Bucket credentials = full fleet control.** Scope each credential to one
   fleet bucket.
 - **`wrangler.json` `vars` go to the bucket in the clear** and stay in every
-  past deployment version. celld has no secret store — pass secrets per node via
-  `CELLD_VARS_FILE` / `CELLD_VAR_*`, which never leave the machine. See
+  past deployment version. celld has no secret store, and as of v0.5.0 no
+  per-node override either (`CELLD_VARS_FILE`/`CELLD_VAR_*` were removed) — see
   *Secrets and Worker vars*.
 - celld is **alpha**: pin `CELLD_VERSION`, keep operator tooling and binary on
   the same release, expect `CELLD_*` defaults to shift.
