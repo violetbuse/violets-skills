@@ -1,6 +1,6 @@
 # celld ↔ Cloudflare Workers compatibility
 
-Distilled from celld v0.4.1: `docs/cloudflare-compat.md` and `docs/wasm.md` in
+Distilled from celld v0.5.0: `docs/cloudflare-compat.md` and `docs/wasm.md` in
 <https://github.com/denoland/celld> (fetch those for the primary text).
 celld implements the Cloudflare Workers APIs and **must reject an
 unsupported configuration or API at deployment or first use** — an unsupported
@@ -16,19 +16,19 @@ and differences.
 
 | Service | Status | Key notes |
 | --- | --- | --- |
-| Workers | Yes | No custom domain / TLS termination — do it at ingress. Outbound `fetch` honors a caller `AbortSignal`; an incoming request's signal is not inherited by subrequests. |
-| Durable Objects | Yes | SQLite storage, alarms, hibernating WebSockets. See the storage-API notes below. |
+| Workers | Yes | No custom domain / TLS termination — do it at ingress. celld has no Workers AI, and rejects `CELLD_AI_BINDING`/`CELLD_AI_URL` and an `ai` config declaration (both removed in v0.5.0 — call a provider directly). |
+| Durable Objects | Yes | SQLite storage, alarms, hibernating WebSockets. Pending I/O (a timer, a subrequest) stays active after the handler returns with no `ctx.waitUntil()` needed. See the storage-API notes below. |
+| Containers | Experimental | A `containers` entry (`class_name`, `image`, `name`, `instance_type`, `max_instances`) binds a Docker/Podman image to a SQLite-backed DO class — see *Containers* below. Config keys, `ctx.container`, and the security boundary can change without notice. |
 | Static assets | Yes | No edge cache (512 MiB local disk cache, `CELLD_ASSET_CACHE_BYTES`), no compression (put a compressing proxy in front). `_headers` / `_redirects` supported but can't set `connection`/`content-length`/`transfer-encoding`; ≤100 `_headers` rules, ≤2000 static + 100 dynamic `_redirects` rules, 100 KiB each. ≤20,000 assets, 25 MiB each, 1 GiB total. `.assetsignore` needs Wrangler. Each response carries an `etag` + `cache-control: public, max-age=0, must-revalidate`. |
-| Cron Triggers | Yes | One handler per occurrence across the whole fleet. One missed occurrence re-run after downtime. One handler at a time per script; retries a failed handler until the next occurrence unless it calls `noRetry()`. Rejects descending ranges (`SAT-SUN`), `*` inside a list (`1,*`). A service-binding target can't run its own crons. |
-| KV | Yes | No edge cache (`cacheTtl` ignored, `cacheStatus` null). Values > 1 MiB need a fleet bucket. **One writer per namespace** — add namespaces to scale writes. Namespace id = Cloudflare hex form or any stable string. |
-| Queues | Yes | **One writer per queue**; one consumer script (which can't also export `fetch()`). Owner admits ≤256 concurrent producer calls (refuses extra — producer retries). Message id = UUIDv7 (sorts in enqueue order per owner). Messages retained 4 days (not configurable). No pull consumers, no Queues HTTP API, no dashboard controls / R2 event notifications / event subscriptions. |
+| Cron Triggers | Yes | One handler per occurrence across the whole fleet. One missed occurrence re-run after downtime. One handler at a time per script; retries a failed handler until the next occurrence unless it calls `noRetry()`. Rejects descending ranges (`SAT-SUN`) and a list that contains `*`. A service-binding target can't run its own crons. |
+| KV | Yes | No edge cache (`cacheTtl` ignored, `cacheStatus` null). Values > 1 MiB need a fleet bucket. **One writer per namespace** — add namespaces to scale writes. |
+| Queues | Yes | **One writer per queue**; one consumer script (which can't also export `fetch()`). Owner admits ≤256 concurrent producer calls (refuses extra — producer retries). Messages retained 4 days (not configurable). No pull consumers, no Queues HTTP API, no dashboard controls / R2 event notifications / event subscriptions. |
 | D1 | Yes | Binding result ≤ 100,000 rows or 32 MiB. `TEXT` rejects invalid UTF-8 — use `BLOB`. |
-| Workflows | Yes | `create()` replaces a terminal instance with the same id (Cloudflare refuses duplicates). Replays `run()` from the start — code outside a step runs again; a crash after a step side effect can re-run the callback. Non-step work can't stay pending > 60 s. Step result / event payload / params ≤ 1 MiB each. `pause()`/`resume()`/`restart(from)` supported; `retention`, `locationHint`, `delete()`, `deleteBatch()`, rollback, sensitive/`ReadableStream` step results are not. |
+| Workflows | Yes | celld retains a terminal instance 30 days by default; `retention` can request up to 30 days. `locationHint` is accepted (Cloudflare's values) but fleet ownership picks the actual location. Replays `run()` from the start — code outside a step runs again; a crash after a step side effect can re-run the callback. Non-step work can't stay pending > 60 s. Step result / event payload / params ≤ 1 MiB each. `pause()`/`resume()`/`restart(from)` supported; rollback, sensitive/`ReadableStream` step results are not. |
 | R2 | Yes | Uses the fleet bucket under `r2/<bucket_name>/`. `version` = content ETag (identical bytes ⇒ one version). No `ssecKey`, no `jurisdiction`. Conditional write can't use a streamed body > 8 MiB. Multipart: no checksum on `createMultipartUpload()`, can't resume on another node or after a restart, can't replace a stored part, out-of-order parts ≤ 256 MiB memory. |
-| Workers AI | No (native) | Experimental HTTP adapter: with `CELLD_AI_URL` set, `env.AI.run()` POSTs `{model, input}` as JSON. Third options arg: `returnRawResponse: true` returns the upstream `Response` (also for error status); default parses JSON and throws on non-2xx. `signal` cancels. |
-| Vectorize / Hyperdrive / Browser Rendering / Email Workers / Python Workers | No | — |
-| Dynamic Workers (Worker Loader / Code Mode) | Experimental | `CELLD_WORKER_LOADER=LOADER` exposes `env.LOADER`. A call from a DO into a loaded Worker (or a service binding) waits for the DO's durability proof. No `globalOutbound` Fetcher, no capability stub in `env`, no awaitable/pipelined properties. `CELLD_MAX_LOADED_WORKERS` default 256. |
-| Durable Object Facets | Experimental | Requires Dynamic Workers. `ctx.facets` → `get()`, `abort()`, `delete()`. A facet has an isolated SQLite DB replicated with the root DO; a facet's outbound effect / `storage.sync()` waits for the **root** object's durability proof. No `ctx.exports`/DO-binding facet class, no `clone()`. |
+| Workers AI / Vectorize / Hyperdrive / Browser Rendering / Email Workers / Python Workers | No | — |
+| Dynamic Workers (Worker Loader / Code Mode) | Yes | Declared with the `worker_loaders` config key in `wrangler.json` (no env var, and no longer experimental — `CELLD_WORKER_LOADER`/`CELLD_MAX_LOADED_WORKERS` are removed). Process-wide limit: 256 live loaded Workers, ≤255 slots per script generation. `getEntrypoint()`/`getDurableObjectClass()` support only the `props` option (≤1 MiB structured-clone encoded); `WorkerCode.env` takes structured-clone values and Service Binding capabilities (≤1 MiB total). No `limits`/`tails`/`allowExperimental` (rejected); a `globalOutbound` Fetcher can't `connect()` or use a WebSocket; a loaded entrypoint can't transfer to another Worker; no awaitable/pipelined properties. |
+| Durable Object Facets | Yes | Requires Dynamic Workers and a class from a Worker Loader binding (no `ctx.exports`/DO-binding facet class). `ctx.facets` → `get()`, `abort()`, `delete()`; no `clone()`. Each facet has an isolated SQLite DB replicated with the root DO; celld rejects an outbound effect from a facet while a root storage transaction holds an uncommitted facet image. An explicit transaction's writes are visible only in the facet until commit, when they become available for root replication; a rollback discards them. |
 
 ## Durable Object storage API — celld specifics
 
@@ -39,8 +39,14 @@ and differences.
   and `CELLD_OPERATION_DEADLINE_MS` (15000). The reset can stop the object
   before the handler sees the rejection — don't depend on the rejection to
   recover. Also rejects while a `transaction()` is open, and after
-  `ctx.abort()` or a failed `blockConcurrencyWhile()`. With
-  `CELLD_OUTPUT_GATE=0` or no object store, it resolves after the local commit.
+  `ctx.abort()` or a failed `blockConcurrencyWhile()`. Without an object store,
+  it resolves after the local commit — there is no `CELLD_OUTPUT_GATE=0`
+  opt-out anymore (removed in v0.5.0; celld always waits for the configured
+  durability proof).
+- Outside an explicit transaction, a SQL write cursor must finish (be fully
+  read) before a response, an outbound effect, or `storage.sync()` — an
+  unfinished `RETURNING` cursor holds uncommitted writes, and celld rejects
+  that output with an error. A read cursor can stay open.
 - **A handler that fails after it writes answers only after the write is
   durable** — celld holds the error behind the same output gate as a success
   (a later request could read that write). Applies to `fetch`/RPC, all three
@@ -70,25 +76,31 @@ Selected differences:
 
 - **Fetch:** no `cache` option; `redirect` accepts `follow`/`manual`/`error`
   only; celld strips `Content-Length` from a Worker response (kept for `HEAD`).
-  A remote DO call streams the request body and can't retry after transmission
-  starts.
-- **RPC:** a cross-isolate named service binding supports a single method call
-  only — no `fetch()`, awaitable properties, or pipelined paths. `ctx.exports`
-  has only declared entrypoints. A remote RPC retries only when the failed peer
-  attempt didn't start the method — use a stable operation id for other retries.
-- **Streams:** an unclaimed/inactive HTTP stream expires after 60 s.
+  An inbound `Request`'s `cf` object has no Cloudflare edge fields (no
+  geolocation/colo/TLS metadata). A remote DO call streams the request body
+  and can't retry after transmission starts.
+- **RPC:** an RPC stub still can't cross an isolate boundary, but a named
+  service binding now supports `fetch()` on a named entrypoint across
+  isolates, not just a single method call (v0.5.0). An `AbortSignal` in a DO
+  RPC call passes through only **on the same node** — it does not cross a node
+  boundary. A remote RPC retries only when the failed peer attempt didn't
+  start the method — use a stable operation id for other retries.
+- **Streams:** an unclaimed/inactive HTTP stream expires after 60 s (an
+  expired/unknown stream reports an error, not EOF).
 - **WebSockets:** must `accept()` from a subrequest upgrade; celld rejects an
   upgrade unless the response status is 101; 1 MiB byte budget on non-terminal
   frames per input queue (a bigger message blocks further reads until consumed);
   a close frame with an invalid status ⇒ close code 1002, `wasClean` false;
   transport can't move owner — client reconnects with the same operation id;
-  `acceptWebSocket()` throws above 90% V8 heap.
+  `acceptWebSocket()` throws above 90% V8 heap. A tunneled connection forwards
+  the owner's Close frame as-is; if the owner connection fails between frames
+  before sending a Close, the ingress sends code 1012, and an incomplete frame
+  closes the transport instead.
 - **Web Crypto:** HMAC hashes MD5/SHA-1/SHA-224/256/384/512; ECDSA P-256 +
   SHA-256 only; AES-GCM tags 96–128 bits in 8-bit steps; RSA-OAEP
   SHA-1/256/384/512; no `jwk` for a secret key in `exportKey()`/`wrapKey()`.
-- **Web standards:** `AbortSignal` doesn't abort an RPC call; `signal.onabort`
-  has no effect (use `addEventListener("abort", …)`); `structuredClone()`
-  doesn't clone an `AbortSignal`.
+- **Web standards:** an `AbortSignal` now crosses a DO RPC call, but only on
+  the same node (see RPC above); it still doesn't cross a node boundary.
 - **Performance:** `performance.timeOrigin` = 0, `performance.now()` ==
   `Date.now()`; both advance only at an I/O boundary.
 - **Node.js compat — implemented:** `node:assert`, `node:async_hooks`,
@@ -123,7 +135,8 @@ navigation flags. Every other flag is accepted without effect;
 - Accepted top-level keys: `$schema`, `name`, `main`, `no_bundle`,
   `compatibility_date`, `compatibility_flags`, `durable_objects`, `migrations`,
   `assets`, `services`, `triggers`, `vars`, `d1_databases`, `kv_namespaces`,
-  `queues`, `workflows`, `r2_buckets`.
+  `queues`, `workflows`, `r2_buckets`, `worker_loaders`, `containers` (the
+  last two added in v0.5.0 — see the Dynamic Workers / Containers rows above).
 - **Any other top-level key — including `routes` and `rules` — stops the
   deploy.** Configure routing in your ingress. There is no equivalent of
   wrangler's module `rules`: the bundler runs esbuild with only
@@ -145,3 +158,39 @@ deploy` uploads each wasm file beside the bundle and marks the deployment
 `wasm-v1` (an older node refuses it at deploy time). Each module is compiled
 once per process and reused by every isolate. Rust: `worker-build --release`
 (from `workers-rs`) → point `main` at `build/worker/shim.mjs` → `celld deploy`.
+
+**Prebuilt Workers (`no_bundle: true`, since v0.5.0):** celld preserves the
+entry JS byte-for-byte and applies Wrangler's default `**/*.wasm` /
+`**/*.wasm?module` scan below the directory containing `main`, so a prebuilt
+`main` can import a `.wasm` at a relative path under it. The scan finds every
+matching file, imported or not — use a dedicated build output directory so
+celld doesn't upload unrelated wasm, and copy (don't symlink) a wasm file into
+that directory. This mode doesn't discover extra JS modules and doesn't
+accept `rules` / `base_dir` / `find_additional_modules`; it needs no `esbuild`
+on `PATH`. See `docs/wasm.md` § *Prebuilt Workers*.
+
+## Containers
+
+See `SKILL.md` § *Containers* for the config shape, the node-side engine
+requirement, network fencing, the `ctx.container` surface, and
+`@cloudflare/containers` / `@cloudflare/sandbox` support — condensed here:
+
+- `image` is a Dockerfile path or an image reference; `celld deploy` builds
+  (`linux/amd64` by default) or pulls it with the `docker` CLI (or
+  `CELLD_DOCKER`) and uploads it once to `deploy/images/<key>.tar`, so a node
+  never contacts a registry.
+- A node needs a Docker/Podman daemon to run the class at all; `CELLD_CONTAINER_RUNTIME`
+  (or a per-class `runtime` key) selects the OCI runtime, e.g. `runsc`/`kata`
+  for real kernel isolation — the default runtime is only a namespace boundary.
+- celld fences every container's network with nftables via a one-shot
+  `celld-fence` image before any container starts: `enableInternet: true`
+  reaches the Internet but not the node, other nodes, private ranges, or
+  link-local addresses; `enableInternet: false` gets no route out.
+- `ctx.container` supports `start()`, `monitor()`, `destroy()`, `signal()`,
+  `getTcpPort()`, `exec()`, `setInactivityTimeout()`; no `inspect()`, no
+  snapshot methods, no outbound interception. A container's disk survives an
+  idle eviction but not a node move/restart/reset.
+- `@cloudflare/containers` and `@cloudflare/sandbox` (on `cloudflare/sandbox`)
+  run as published; a move to another node stops the container, so the first
+  post-move call can raise the SDK's `OperationInterruptedError`, same as a
+  Cloudflare container restart.

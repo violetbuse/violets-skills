@@ -1,6 +1,6 @@
 # Operating a celld fleet
 
-Distilled from celld v0.4.1: `docs/README.md`, `docs/security.md`,
+Distilled from celld v0.5.0: `docs/README.md`, `docs/security.md`,
 `docs/telemetry.md`, `docs/limitations.md`, and `crates/celld/main/cli.rs` in
 <https://github.com/denoland/celld> (fetch those, or run `celld --help`, for
 the primary text). celld is alpha — the operator API and `CELLD_*` defaults can
@@ -65,8 +65,12 @@ hibernatable WebSockets are kept; the move touches no bucket.
 
 ## Worker vars and secrets
 
-celld has no encrypted secret store (no `wrangler secret`, no `.dev.vars`).
-Worker vars (`plain_text` bindings, read as `env.NAME`) resolve on each node at
+celld has no encrypted secret store (no `wrangler secret`). `celld dev` reads
+a local `.dev.vars` file (`NAME=value` per line, quotes stripped) for
+developer convenience and turns each entry into a Worker var, overriding a
+same-named `vars` entry; only `celld dev` reads it, so it never reaches a
+deployed fleet. Worker vars (`plain_text` bindings, read as `env.NAME`)
+otherwise resolve on each node at
 deployment-build time from three sources, later wins:
 
 1. `vars` in `wrangler.json` — string values only; become `plain_text` bindings
@@ -93,9 +97,10 @@ file and `POST /reload` (rebuilds unchanged code) to apply with no restart.
   (`fleet/capacity-v1.json`); others read the result.
 - Each node has an ownership target = fleet owned cells ÷ node weights
   (`CELLD_PLACEMENT_WEIGHT`, default CPU count). The node with the most owned
-  cells per unit weight hands ≤ `CELLD_REBALANCE_BATCH_CELLS` (32) **hibernated**
-  cells per sample to the peer furthest below its target (receiver fills to 2%
-  below target so a stale sample can't cause a trade-back).
+  cells per unit weight hands ≤ 32 **hibernated** cells per sample (a fixed
+  ceiling — no longer an env var; the release ceiling `CELLD_RELEASES` still
+  applies) to the peer furthest below its target (receiver fills to 2% below
+  target so a stale sample can't cause a trade-back).
 - Only a hibernated cell moves — one ownership-record write + one signed
   acquire; it stays hibernated on the new owner; parked hibernatable WebSockets
   close 1012 so clients reconnect. A **resident** cell moves only after idle
@@ -163,9 +168,18 @@ serializes concurrent donors (one node hands off at a time).
 | --- | --- | --- |
 | `CELLD_RELEASES` | 128 | max complete handoffs in progress |
 | `CELLD_ACTIVATIONS` | 8/CPU, ≥16 ≤128 | concurrent cold-cell activations / restore work |
-| `CELLD_SHUTDOWN_DRAIN_MS` | 25000 | max interval with no completed handoff (each ack restarts it) |
-| `CELLD_SHUTDOWN_TOTAL_MS` | 40000 | complete-process-stop bound |
-| `CELLD_DRAIN_TOKEN_WAIT_MS` | 30000 (`0` disables) | wait for the fleet drain token before proceeding without it; must be ≤ ¾ of the total bound |
+| `CELLD_SHUTDOWN_TOTAL_MS` | 40000 | complete-process-stop bound; the orchestrator stop grace must exceed it |
+
+celld now derives every other shutdown wait from `CELLD_SHUTDOWN_TOTAL_MS`
+instead of taking them as separate settings: the fleet drain-token wait is ¾ of
+the total bound (30000 ms at the default), and the handoff no-progress
+interval (each successor acknowledgement restarts it) is ⅝ of the total bound
+(25000 ms at the default, minimum 1 ms after rounding). A same-node preserve
+uses the no-progress interval as its limit, since it has no successor acks.
+`CELLD_SHUTDOWN_DRAIN_MS`, `CELLD_DRAIN_TOKEN_WAIT_MS`, and `CELLD_PACED_HANDOFF`
+are **removed** — celld rejects them at startup (including an empty value or
+one matching the old default). Set only `CELLD_SHUTDOWN_TOTAL_MS` if the
+derived defaults don't fit your orchestrator grace.
 
 A fresh process holds its first healthy response until the fleet is settled
 (live node lease, no active donor, memory below every pressure low watermark,
@@ -187,7 +201,34 @@ gate paces against fleet recovery.
 | v0.2.1 → v0.3.0 | Yes, one at a time | Default durability moves `bucket` → `fleet`. A v0.3.0 node can't replicate to a v0.2.x peer (acks via the bucket until the peer upgrades). Do not start a v0.2.x binary after a node ran v0.3.0 unless its shutdown log has `node-log close: sealed epoch` — otherwise this downgrade can lose acked writes. |
 | v0.3.0 → v0.4.0 | **No** — stop all, then start all | v0.4.0 moves every proxied cell call onto one tunneled plain-HTTP connection and the peer protocol refuses a different version. It also stores large KV values under the ownership epoch with an epoch-qualified row reference a v0.3.0 node can't read — a mixed fleet can make a committed KV value unavailable. |
 | v0.4.0 → v0.4.1 | Yes, one at a time | v0.4.1 restores a large cell by paging; a paged epoch continues its predecessor's chain and a v0.4.0 node can't restore it. Each node publishes the bucket format it reads in its lease and only pages a takeover while every live lease reads that format; a mixed fleet clones like v0.4.0. Do not start a v0.4.0 binary after paging begins. |
+| v0.4.1 → v0.5.0 | **No** — stop all, then start all | v0.5.0 replaces the alarm-discovery/wake bucket layout (format 2 under `wake/entries/` + `wake/retired/`) and a v0.4.1 node can't read it. See *Alarm/wake-format migration* below — the upgrade requires a full stop, a backup, and revoking the old binaries' write access before restart. |
 | within a fleet, L1 compaction | — | `CELLD_LTX_COMPACTION=0` on every node of a mixed fleet until all can read v0.5.2 block objects — an old reader can't take a cell over after its first L1 publication. |
+
+### Alarm/wake-format migration (v0.4.1 → v0.5.0)
+
+v0.5.0 gives each alarm installation its own durable object under
+`wake/entries/`/`wake/retired/` (format 2) instead of the v0.4.1 layout, so a
+mixed fleet can't serve — v0.4.1 can't read the new entries and stale
+`wake-format.json`/`wake-v2/`/`wake-retired-v2/` names are treated as
+unsupported data:
+
+1. Stop application traffic and deployment writers, then stop every v0.4.1
+   node and its supervisor and wait for every node lease to expire.
+2. Back up the stopped fleet's bucket and each node's local data directory —
+   a follower disk can hold acknowledged writes the bucket doesn't have yet.
+3. Revoke the old binaries' bucket write access (credential rotation or a
+   deployment-system change) so they can't restart into the fleet; the format
+   marker alone doesn't stop them.
+4. Start v0.5.0 on every node with the same configuration, data, and
+   addresses, and wait for the fleet to report healthy before resuming
+   traffic. Startup migrates the format automatically (paged inventory,
+   discovery seed per cell); a live v0.4.1 lease blocks the migration, and if
+   a node stops mid-migration another starting node resumes it — the fleet
+   serves nothing until the inventory completes. Alarms can fire late during
+   the outage.
+
+Do not roll back by starting a v0.4.1 binary against an upgraded bucket —
+restore the pre-upgrade backup instead, which loses any writes made after it.
 
 ## Telemetry
 
@@ -199,14 +240,17 @@ stays one trace; a malformed header starts a new trace.
 
 | Var | Default | Effect |
 | --- | --- | --- |
-| `CELLD_OTEL` | `0` | `1` enables |
-| `CELLD_OTEL_SINK` | `bucket` | `bucket` = Parquet under `telemetry/`; `otlp` = OTLP/HTTP protobuf to a collector |
+| `CELLD_OTEL` | `0` | `0` disables. `1` writes Parquet to the fleet bucket. A full HTTP(S) collector base URL (no query/fragment — celld appends `/v1/traces` and `/v1/logs`) sends OTLP/HTTP instead. There's no separate sink switch and celld does not read `OTEL_EXPORTER_OTLP_ENDPOINT`. |
 | `CELLD_OTEL_BUCKET` | fleet bucket | alternate bucket, same endpoint/credentials |
-| `CELLD_OTEL_RETENTION` | `30d` | `none` keeps forever (use your own lifecycle rules) |
-| `CELLD_OTEL_FLUSH_MS` / `CELLD_OTEL_FLUSH_BYTES` | `300000` / `5242880` | write a Parquet file at whichever limit is hit first; `10000` ms for near-live (needs the compaction job) |
+| `CELLD_OTEL_RETENTION` | `30d` | `none` keeps forever (use your own lifecycle rules); the sweep runs at startup and every 6h after |
+| `CELLD_OTEL_FLUSH_MS` / `CELLD_OTEL_FLUSH_BYTES` | `300000` / `5242880` | write a Parquet file at whichever limit is hit first (the byte limit is an estimate, so a batch can run slightly over); `5000` ms for a five-second batching interval (needs the compaction job) |
 | `OTEL_TRACES_SAMPLER` (+ `_ARG`) | `parentbased_always_on` | standard sampler names; `traceidratio` for a fraction |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` (+ `_HEADERS`, `_TIMEOUT`) | `http://localhost:4318` | for `otlp` |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TIMEOUT` | unset / `10000` | comma-separated `name=value` headers / request timeout (ms) for the collector `CELLD_OTEL` names |
 | `OTEL_SERVICE_NAME` | `celld` | resource service name |
+
+`CELLD_OTEL_SINK` is **removed** — celld rejects it at startup. Copy a
+collector's full base URL into `CELLD_OTEL` directly; keep `CELLD_OTEL=1` for
+the fleet bucket.
 
 Bucket sink layout: `telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`
 (logs under `telemetry/logs/...`). Schema `v0-unstable` — column names can
@@ -225,6 +269,30 @@ SELECT name, duration_us, trace_id FROM traces ORDER BY duration_us DESC LIMIT 2
 Run compaction on a maintenance node (not a celld node): rewrite each past
 hour's small files into one `compacted.parquet` sorted by `start_unix_us`,
 delete the sources, never touch the current hour.
+
+## Containers (experimental)
+
+App-level details (config keys, `ctx.container`, fencing, package support) are
+in `SKILL.md`. Operationally:
+
+- Each node that serves a `containers` class needs its own Docker or Podman
+  daemon reachable at `DOCKER_HOST` or the engine's default socket. A node
+  without one refuses `start()` for that class but keeps serving every other
+  class — there's no fleet-wide fallback.
+- `celld deploy` uploads each built/pulled image once to
+  `deploy/images/<key>.tar` (keyed by layer + config hash), plus the
+  `celld-fence` image every container deployment needs; a node loads an image
+  into its own engine the first time a cell of the class starts, so no node
+  ever contacts a registry, and a redeploy of an unchanged image uploads
+  nothing.
+- `max_instances` is enforced from the shared node sample (the same one
+  ownership balancing reads), not a coordinator — a node sums the fleet's
+  published running-container counts and its own live count before a start.
+  Two nodes racing a start at once can briefly exceed the cap and converge on
+  the next sample refresh (`CELLD_REBALANCE_INTERVAL_MS`).
+- A node stop destroys every container on it (disk included); plan container
+  workloads around that the same way you'd plan around a Cloudflare container
+  restart.
 
 ## Environment variables (primary set)
 
@@ -246,16 +314,18 @@ variable takes its documented default.
 `CELLD_UNSAFE_PUBLIC_ADVERTISE`, `CELLD_TRUST_FORWARDED_HEADERS`.
 
 **Durability:** `CELLD_DURABILITY` (`fleet` default / `bucket`),
-`CELLD_OUTPUT_GATE` (`0` removes the durability wait — accepts loss),
 `CELLD_LTX_DURABILITY_TIMEOUT_SECS` (10; one proof's budget, from upload start;
 ≤6 budgets when queued behind other cells), `CELLD_OPERATION_DEADLINE_MS`
-(15000).
+(15000). `CELLD_OUTPUT_GATE` is **removed** — celld always waits for the
+configured durability proof; celld rejects the variable, including `1` or an
+empty value.
 
 **Placement / capacity:** `CELLD_MAX_RESIDENT_CELLS`, `CELLD_IDLE_EVICT_S`,
 `CELLD_PLACEMENT_WEIGHT`, `CELLD_REBALANCE_INTERVAL_MS` (5000, `0` disables),
-`CELLD_REBALANCE_BATCH_CELLS` (32), `CELLD_PRESSURE_OWNERSHIP`
-(`release` / `sticky`), `CELLD_ACTIVATIONS`, `CELLD_EVICTIONS` (4),
+`CELLD_PRESSURE_OWNERSHIP` (`release` / `sticky`), `CELLD_ACTIVATIONS`,
 `CELLD_MAX_CELL_REQUESTS` (64), `CELLD_MAX_REQUEST_BODY_BYTES` (1 GiB).
+`CELLD_REBALANCE_BATCH_CELLS` (fixed at 32) and `CELLD_EVICTIONS` (fixed at 4
+concurrent evictions) are **removed**.
 
 **Memory:** `CELLD_MAX_RSS_MB` (80%, `0` disables threshold + cap),
 `CELLD_V8_HEAP_LIMIT_MB` (128), `CELLD_LOCAL_CACHE_MAX_BYTES` (2 GiB, `0`
@@ -263,31 +333,45 @@ disables), `CELLD_ASSET_CACHE_DIR`, `CELLD_ASSET_CACHE_BYTES` (512 MiB).
 
 **Deploy / lease:** `CELLD_DEPLOY_POLL_S` (30), `CELLD_DEPLOY_MAX_AGE_S` (60),
 `CELLD_TTL_MS` (10000), `CELLD_VARS_FILE` / `CELLD_VAR_*` (per-node Worker var
-overrides, never uploaded to the bucket — see *Worker vars and secrets*),
-`CELLD_STORAGE_PROBE` (`0` skips startup storage test).
+overrides, never uploaded to the bucket — see *Worker vars and secrets*).
+`CELLD_STORAGE_PROBE` is **removed** — the startup storage-contract test can no
+longer be skipped.
 
 **Recovery / shutdown:** `CELLD_RECOVERY_RETRY_MS` (1000),
 `CELLD_RECOVERY_RETRIES` (240), `CELLD_RELEASES` (128),
-`CELLD_SHUTDOWN_DRAIN_MS` (25000), `CELLD_SHUTDOWN_TOTAL_MS` (40000),
-`CELLD_DRAIN_TOKEN_WAIT_MS` (30000), `CELLD_READY_FLEET_GATE_MS` (120000).
+`CELLD_SHUTDOWN_TOTAL_MS` (40000), `CELLD_READY_FLEET_GATE_MS` (120000).
+`CELLD_SHUTDOWN_DRAIN_MS`, `CELLD_DRAIN_TOKEN_WAIT_MS`, and
+`CELLD_PACED_HANDOFF` are **removed** — see *Graceful shutdown & rollout*.
 
 **LTX replication:** `CELLD_LTX_TRUNCATE_PAGES` (128, 512 KiB WAL cap; Queues
 never truncate; `0` disables), `CELLD_LTX_COMPACTION` (`1`; `0` on a mixed
 fleet until all nodes read block objects), `CELLD_LTX_COMPACTION_MIN_TXIDS`
 (256), `CELLD_LTX_COMPACTION_MIN_MB` (32, ≤64), `CELLD_LTX_COMPACTIONS` (2),
 `CELLD_LTX_PAGED` (`1`; `0` on a mixed fleet until all nodes run ≥v0.4.1),
-`CELLD_LTX_PAGED_MIN_MB` (256), `CELLD_LTX_HYDRATE_MBPS` (16).
+`CELLD_LTX_PAGED_MIN_MB` (256), `CELLD_LTX_HYDRATE_MBPS` (16). Each L1
+compaction merges ≤256 source objects with a 64 MiB buffer budget, spilling to
+temporary files in the cell's local LTX directory for an oversized source.
 
-**Logs / queues:** `CELLD_LOG_CAPTURE_WORKERS` (8), `CELLD_LOG_PIPELINE` (4),
-`CELLD_LOG_GROUP_COMMIT_MS` (1), `CELLD_QUEUE_PRODUCER_GROUP_MS` (4),
-`CELLD_LOG_HEDGE_MS` (adaptive; `0` disables), `RUST_LOG` (default `info`).
+**Logs / queues:** `CELLD_LOG_PIPELINE` (4), `CELLD_LOG_HEDGE_MS` (adaptive;
+`0` disables), `RUST_LOG` (default `info`). `CELLD_LOG_CAPTURE_WORKERS` (fixed
+at 8), `CELLD_LOG_GROUP_COMMIT_MS` (fixed at 1 ms), and
+`CELLD_QUEUE_PRODUCER_GROUP_MS` (fixed at 4 ms) are **removed**.
 
 **Alarms / timers:** `CELLD_ALARM_RESIDENT_MS`, `CELLD_WAKER_TICK_MS`,
 `CELLD_FETCH_TIMEOUT_S`, `CELLD_HANDLER_BUDGET_S`, `CELLD_TOKIO_THREADS`.
 
-**Experimental:** `CELLD_WORKER_LOADER` (Worker Loader / Code Mode binding
-name), `CELLD_MAX_LOADED_WORKERS` (256), `CELLD_AI_BINDING` / `CELLD_AI_URL`
-(env.AI HTTP adapter).
+**Containers (experimental):** `CELLD_DOCKER` (engine CLI, default `docker`),
+`CELLD_CONTAINER_PLATFORM` (build target for `celld deploy`, default
+`linux/amd64`), `CELLD_CONTAINER_RUNTIME` (node-wide OCI runtime, e.g. `runsc`
+/ `kata`; a `containers` entry's own `runtime` key overrides it),
+`CELLD_CONTAINER_DNS` (extra public resolvers for a container under a named
+runtime; `1.1.1.1` is always included). See *Containers* above.
+
+`CELLD_WORKER_LOADER`, `CELLD_MAX_LOADED_WORKERS`, `CELLD_AI_BINDING`, and
+`CELLD_AI_URL` are **removed**. Declare a Worker Loader with the
+`worker_loaders` config key in `wrangler.json` instead of an env var — Dynamic
+Workers is no longer experimental. The `env.AI` HTTP adapter is gone entirely;
+call an AI provider directly from application code.
 
 ## Fleet limitations (alpha)
 
@@ -303,3 +387,6 @@ name), `CELLD_MAX_LOADED_WORKERS` (256), `CELLD_AI_BINDING` / `CELLD_AI_URL`
 - Installer binaries: Linux x86-64, Linux ARM64, Apple Silicon. **No Windows.**
 - An outbound Durable Object WebSocket keeps its cell resident and closes if the
   cell moves — store the connection intent and reconnect.
+- Containers are experimental and need a Docker/Podman daemon per node that
+  serves the class; `max_instances` is a fleet-wide cap enforced from a
+  sampled node count, not a coordinator, so it can be briefly exceeded.

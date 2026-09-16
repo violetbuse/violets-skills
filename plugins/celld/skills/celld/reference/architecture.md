@@ -1,6 +1,6 @@
 # celld architecture & guarantees
 
-Distilled from celld v0.4.1: `docs/guarantees.md`, `docs/README.md`,
+Distilled from celld v0.5.0: `docs/guarantees.md`, `docs/README.md`,
 `docs/testing.md`, and `crates/celld/protocol.rs` in
 <https://github.com/denoland/celld> (fetch those files for the primary text).
 
@@ -46,8 +46,10 @@ serves, then requests part of a second object and verifies the range and bytes.
 Startup test makes ≤3 attempts on an unclear failure (starts with a warning if
 all fail — a transient outage can clear), but stops immediately on an
 unsupported conditional write / ranged read or a store that ignores a
-condition or returns wrong bytes. `CELLD_STORAGE_PROBE=0` disables it; or run
-`celld diagnose --read-only` with a non-writing credential.
+condition or returns wrong bytes. This startup test is mandatory since v0.5.0
+— `CELLD_STORAGE_PROBE` (the old opt-out) is removed and rejected at startup;
+run `celld diagnose --read-only` with a non-writing credential to probe
+on demand instead.
 
 ## The supervisor
 
@@ -133,6 +135,24 @@ downloading the whole chain. The file then fills in the background at
 chain is cloned whole. A paged cell's local file is a cache — not preserved as
 an eviction snapshot, not used for a handoff snapshot.
 
+### Alarm discovery (wake format 2, since v0.5.0)
+
+SQLite alone holds the alarm deadline, consumption, retry state, and
+installation identity — a wake-format record is only a **hint** that makes
+celld read that SQLite state; it never authorizes a handler to run on its own.
+Each committed alarm installation gets its own conditionally-written object
+under `wake/entries/`, keyed by ownership epoch + a persistent SQLite
+sequence, so an update within the same minute still needs a fresh publication
+PUT and an old installation's identity can't collide with a newer one.
+Retirement publishes a proof-backed record under `wake/retired/` — requiring a
+durability proof, the current owner, and (if an alarm is still armed) a
+confirmed replacement publication — instead of a conditional delete, which the
+bucket contract doesn't offer. This is a **breaking bucket-layout change from
+v0.4.1**: the format is versioned (`wake/format.json` selects format 2), an
+unsupported format blocks startup, and a v0.4.1 node cannot read it — see the
+v0.4.1→v0.5.0 upgrade procedure in `reference/operations.md`, which needs a
+full fleet stop, not a rolling restart.
+
 ### Self-fencing
 
 Each node holds a bucket lease with an expiry, renewed after ⅓ of the lifetime
@@ -160,12 +180,17 @@ and celld — "these objects are the interface; nothing else is exchanged":
   `script_name`, `main_module` (absent for asset-only), `do_classes`,
   `sqlite_classes`, `modules` (each `ModuleRef` carries a full SHA-256; a
   legacy 16-char prefix digest is also accepted), `assets`, `crons`,
-  `queue_consumers`, `required_features`, and `raw_metadata` (wrangler's raw
-  metadata verbatim).
+  `queue_consumers`, `containers` (each spec's class, image id, and instance
+  shape; `deploy/images/<id>.tar` holds the tar), `fence_image` (the
+  `celld-fence` image built alongside a deployment with containers — `None`
+  otherwise, and on a deployment from a celld that predates it, which then
+  refuses to start containers), `required_features`, and `raw_metadata`
+  (wrangler's raw metadata verbatim).
 - `required_features` gate — a node rejects a manifest needing a feature it
   doesn't support, up front (not at request time). Values:
-  `assets-v1`, `cron-v1`, `d1-v1`, `kv-v1`, `queues-v1`, `sqlite-vec-v1`,
-  `r2-v1`, `wasm-v1`, `workflows-v1`.
+  `assets-v1`, `containers-v1`, `cron-v1`, `d1-v1`, `kv-v1`, `queues-v1`,
+  `sqlite-vec-v1`, `r2-v1`, `wasm-v1`, `workflows-v1`. A `worker_loaders`
+  declaration needs no feature flag — Dynamic Workers is no longer gated.
 - `DeployPointer` — `deploy/current.json`: `{ script_name?, version, prefix,
   rollout: { percent } }`. Changing it *is* a deploy; nodes converge to it.
 - `QueueConsumerAttachment` — `deploy/queues/<queue>/consumer.json`: the one

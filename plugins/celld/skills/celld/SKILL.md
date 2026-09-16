@@ -24,7 +24,7 @@ service.
 
 - Upstream: <https://github.com/denoland/celld> · docs <https://celld.dev/docs>
   (the docs site is generated from the repo's `docs/` folder — same content).
-- **This skill reflects celld v0.4.1** (tagged 2026-09-05). celld is **alpha**:
+- **This skill reflects celld v0.5.0** (tagged 2026-09-15). celld is **alpha**:
   APIs, the operator API, and `CELLD_*` defaults can change between releases.
   Keep operator tooling and the celld binary on the same release — if the
   project is on a different version, verify anything version-sensitive against
@@ -67,8 +67,9 @@ to one or two follower nodes and acks once they've `fsync`'d it (a lab fleet
 measured ~25 ms), uploading to the bucket afterward. **A single node has no
 follower**, so every write waits for a bucket round trip (~90 ms region-local,
 ~600 ms otherwise) — run **2+ nodes if write latency matters**. `bucket` mode
-always waits for the bucket. `CELLD_OUTPUT_GATE=0` removes the wait and accepts
-possible loss of an acknowledged write.
+always waits for the bucket. There is no setting to skip the durability wait —
+`CELLD_OUTPUT_GATE` was removed in v0.5.0; celld always proves a write durable
+before it acknowledges it.
 
 See `reference/architecture.md` for the full protocol (fencing, epoch-chain
 restore, takeover recovery, self-fencing, bucket requirements).
@@ -97,10 +98,17 @@ celld dev --clean         # wipe .celld/dev first, start from empty state
 celld dev --no-watch      # disable auto rebuild/restart on file changes
 ```
 
-- Opens a **local SQLite object store** — no Docker, no cloud bucket. A regular
-  node and the operator subcommands **cannot** use this local backend.
+- Opens a **local SQLite object store** — no Docker, no cloud bucket (unless
+  the project has a `containers` entry — see *Containers*). A regular node and
+  the operator subcommands **cannot** use this local backend.
 - State lives in `.celld/dev` under the project and **survives restarts**. Add
   `.celld/` to the app's `.gitignore`.
+- Reads a `.dev.vars` file beside the Wrangler config, as `wrangler dev` does:
+  `NAME=value` per line, quotes stripped, no other dotenv features. Each entry
+  becomes a Worker var and overrides a same-named entry in `vars`. Only `celld
+  dev` reads it — `celld deploy` never does, so a local credential doesn't
+  reach a fleet. Add `.dev.vars` to `.gitignore`; editing it rebuilds the app
+  with no restart.
 - **Gotcha:** `celld dev` does **not** migrate persisted state across a config
   change. An object can keep a value the new config rejects, and the resulting
   error names the stored value, not the config — looks unrelated to the change.
@@ -178,7 +186,7 @@ celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION" 
   `CELLD_WATCH`, pass the AWS credential env through, expose 8080 via the LB,
   keep 8081 private.
 - Installer: `curl -fsSL https://celld.dev/install.sh | sh` (pin with
-  `CELLD_VERSION=v0.4.1`; verify with `gh attestation verify <asset> --repo
+  `CELLD_VERSION=v0.5.0`; verify with `gh attestation verify <asset> --repo
   denoland/celld`).
 
 ## Operator CLI
@@ -250,20 +258,26 @@ Example projects (`examples/<name>/` in the celld repo): `hello` (stateless fetc
 `rpc` (JS RPC via `getByName`), `wsecho` (hibernating WebSocket),
 `wsclient` (outbound WebSocket from a DO), `alarm`, `cron`, `d1`, `kv`, `r2`,
 `workflow`, `vectordb` (`sqlite_vec` flag), `wasm` (Rust via workers-rs),
-`pi` / `opencode` (agent loops in a DO).
+`facets` (Worker Loader + a facet class), `container` / `sandbox` (Cloudflare
+Sandbox SDK on a container), `pi` / `opencode` (agent loops in a DO).
 
 **Compatibility highlights** (full list + every gap in
 `reference/cloudflare-compat.md`):
 
 - **Yes:** Workers, Durable Objects (SQLite storage, alarms, hibernating
-  WebSockets), static assets (`_headers`/`_redirects`, no edge cache/compression),
-  Cron Triggers, KV, Queues, D1, Workflows, R2. Most runtime APIs — fetch,
-  streams, WebSockets, Web Crypto, WebAssembly, HTMLRewriter, TCP sockets.
-- **Experimental (opt-in):** Dynamic Workers / Worker Loader
-  (`CELLD_WORKER_LOADER`), Durable Object Facets, `env.AI` HTTP adapter
-  (`CELLD_AI_URL`).
-- **No:** Workers AI (native), Vectorize, Hyperdrive, Browser Rendering, Email
-  Workers, Python Workers, BroadcastChannel, `tail`/`email` handlers.
+  WebSockets, Facets), static assets (`_headers`/`_redirects`, no edge
+  cache/compression), Cron Triggers, Dynamic Workers (Worker Loader, declared
+  with the `worker_loaders` config key — no env var), KV, Queues, D1,
+  Workflows, R2. Most runtime APIs — fetch, streams, WebSockets, Web Crypto,
+  WebAssembly (including `no_bundle` prebuilt deployments), HTMLRewriter, TCP
+  sockets.
+- **Experimental (opt-in):** Containers (the `containers` config key; needs a
+  Docker/Podman daemon on every node that serves the class — see
+  *Containers*), including `@cloudflare/containers` and the Cloudflare
+  Sandbox SDK.
+- **No:** Workers AI (no binding, no HTTP adapter — call the provider
+  directly), Vectorize, Hyperdrive, Browser Rendering, Email Workers, Python
+  Workers, BroadcastChannel, `tail`/`email` handlers.
 - **Partial:** Node.js compat (a fixed module set), Cache API (always-miss).
 - **Key differences:** no TLS termination (do it at ingress); SQLite `TEXT`
   rejects invalid UTF-8 (use `BLOB`); one writer per KV namespace and per
@@ -274,10 +288,46 @@ Example projects (`examples/<name>/` in the celld repo): `hello` (stateless fetc
   (`CELLD_MAX_CELL_REQUESTS`); excess gets HTTP 503 + `Retry-After: 1` +
   `X-Celld-Overload: cell`.
 
+## Containers (experimental)
+
+A `containers` entry (`class_name`, `image`, `name`, `instance_type`,
+`max_instances`) binds a Docker/Podman image to a SQLite-backed Durable Object
+class. `celld deploy`/`celld dev` build or pull the image with `docker` on
+`PATH` (or `CELLD_DOCKER`); a deploy builds for `linux/amd64` by default
+(`CELLD_CONTAINER_PLATFORM` overrides), uploads it to the bucket as
+`deploy/images/<key>.tar`, and a node loads it into its own engine on first
+use — no registry contact. `instance_type` maps to Cloudflare's CPU/memory
+shapes (default `dev`); `max_instances` is a fleet-wide soft cap computed from
+the shared node sample, so two nodes starting at once can briefly exceed it.
+
+- **Every node that serves the class needs a Docker/Podman daemon.** A node
+  without one refuses `start()` for that class but serves everything else.
+  `CELLD_CONTAINER_RUNTIME` (or a per-class `runtime` key) selects the OCI
+  runtime — use `runsc`/`kata` to give untrusted container code its own
+  kernel; the default runtime is only a namespace boundary.
+- celld fences every container's network with nftables via a one-shot
+  privileged `celld-fence` image (shipped with the deployment): with
+  `enableInternet: true` it reaches the Internet but not the node, other
+  nodes, private ranges, or link-local addresses; `enableInternet: false`
+  gets no route out. A node that can't install the fence starts no container.
+- A container's disk is ephemeral: it survives an idle eviction
+  (`setInactivityTimeout()`, default 10 min) but not a move to another node, a
+  node restart, or a reset.
+- `ctx.container` supports `start()` (`entrypoint`/`env`/`enableInternet`/
+  `labels`; no `hardTimeout`), `monitor()`, `destroy()`, `signal()`,
+  `getTcpPort()`, `exec()`, `setInactivityTimeout()`; no `inspect()`,
+  snapshots, or outbound interception. `@cloudflare/containers` and
+  `@cloudflare/sandbox` (on the `cloudflare/sandbox` image) run as published —
+  see `examples/container` / `examples/sandbox`.
+- Config keys, `ctx.container`, and the security boundary can change without
+  notice — this feature is explicitly experimental, not just opt-in.
+
 ## Secrets and Worker vars
 
-celld has **no encrypted secret store** — nothing like `wrangler secret put`,
-and it does **not** read `.dev.vars`. Configuration values reach the Worker as
+celld has **no encrypted secret store** — nothing like `wrangler secret put`.
+`celld dev` reads a local `.dev.vars` file for convenience (see *Develop
+locally*), but a deployed fleet has no equivalent — `celld deploy` never reads
+it. Configuration values reach the Worker as
 **vars** (`plain_text` bindings, read as `env.NAME`), resolved on each node when
 it builds a deployment. Three sources, later wins:
 
@@ -333,19 +383,21 @@ export CELLD_BUCKET=s3://YOUR-BUCKET        # optional /PREFIX lets fleets share
 # Azure: AZURE_STORAGE_ACCOUNT_NAME + one credential family; CELLD_BUCKET=az://YOUR-CONTAINER
 ```
 
-Each node runs the storage-contract test at startup (`CELLD_STORAGE_PROBE=0`
-disables) and stops if a required property is missing or the store silently
-ignores a condition. `celld diagnose` runs the same probe on demand. celld
-reserves these bucket prefixes — the application must not write under them:
-`probe/`, `cells/`, `nodes/`, `node-cells/`, `fleet/`, `deploy/`,
-`deploy-blobs/`, `wake/`, `telemetry/`.
+Each node runs the storage-contract test at startup — mandatory, no opt-out —
+and stops if a required property is missing or the store silently ignores a
+condition. `celld diagnose --read-only` runs the same probe on demand with a
+credential that cannot write. celld reserves these bucket prefixes — the
+application must not write under them: `probe/`, `cells/`, `nodes/`,
+`node-cells/`, `fleet/`, `deploy/`, `deploy-blobs/`, `log/`, `wake/`,
+`telemetry/`.
 
 ## Telemetry (off by default)
 
 `CELLD_OTEL=1` records a span per request/event/outbound-fetch/cell-start and a
-log record per `console.log`. Default sink writes Parquet to the fleet bucket
-under `telemetry/` (query with DuckDB); `CELLD_OTEL_SINK=otlp` sends OTLP/HTTP
-to a collector instead. Reads W3C `traceparent`. Details + DuckDB queries in
+log record per `console.log`, writing Parquet to the fleet bucket under
+`telemetry/` (query with DuckDB). Set `CELLD_OTEL` to a full collector base URL
+(e.g. `http://collector:4318`) to send OTLP/HTTP instead — there's no separate
+sink switch. Reads W3C `traceparent`. Details + DuckDB queries in
 `reference/operations.md`.
 
 ## Common pitfalls
@@ -354,8 +406,10 @@ to a collector instead. Reads W3C `traceparent`. Details + DuckDB queries in
   bucket. Run 2+ nodes when latency matters.
 - **`celld dev` state is not migrated** across config changes; errors point at
   the stored value, not the config. Use `--clean`.
-- **Some version upgrades are not rolling-safe** (v0.1→v0.2, v0.3→v0.4). Check
-  `reference/operations.md` before upgrading a fleet.
+- **Some version upgrades are not rolling-safe** (v0.1→v0.2, v0.3→v0.4,
+  **v0.4.1→v0.5.0**). The v0.5.0 upgrade needs a full fleet stop for a new
+  alarm/wake-format migration — check `reference/operations.md` before
+  upgrading a fleet.
 - **The internal listener is unauthenticated** for most operator routes and has
   no TLS — a trusted private network is mandatory.
 - **`wrangler.toml` and `routes` are rejected.** Convert config to JSON and
