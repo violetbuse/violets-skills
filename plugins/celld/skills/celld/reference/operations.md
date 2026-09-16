@@ -69,25 +69,23 @@ celld has no encrypted secret store (no `wrangler secret`). `celld dev` reads
 a local `.dev.vars` file (`NAME=value` per line, quotes stripped) for
 developer convenience and turns each entry into a Worker var, overriding a
 same-named `vars` entry; only `celld dev` reads it, so it never reaches a
-deployed fleet. Worker vars (`plain_text` bindings, read as `env.NAME`)
-otherwise resolve on each node at
-deployment-build time from three sources, later wins:
-
-1. `vars` in `wrangler.json` — string values only; become `plain_text` bindings
-   in `deploy/<name>/<version>/manifest.json`.
-2. `CELLD_VARS_FILE` — dotenv-style file on the node: `NAME=value` per line,
-   `#` comments and blank lines skipped, one surrounding `'`/`"` pair stripped,
-   no escapes or multi-line values.
-3. `CELLD_VAR_<NAME>` env vars on the node.
+deployed fleet. A deployed fleet's Worker vars (`plain_text` bindings, read as
+`env.NAME`) come from exactly one source: `vars` in `wrangler.json` — string
+values only, baked into `deploy/<name>/<version>/manifest.json` at
+deployment-build time.
 
 `celld deploy` uploads the manifest to the bucket **unencrypted**, and past
 versions are immutable — so anything in `wrangler.json` `vars` is readable by
-any bucket reader forever. To pass a secret without writing it to the bucket,
-keep it out of `vars` and set it per node via `CELLD_VARS_FILE` / `CELLD_VAR_*`;
-those are never uploaded. Deliver the file/env to **every** node out of band
-(systemd `EnvironmentFile=`, mounted secret, config manager) — a var on only
-some nodes makes behaviour depend on which node served the request. Edit the
-file and `POST /reload` (rebuilds unchanged code) to apply with no restart.
+any bucket reader forever. **v0.5.0 removed the only mechanism that used to
+avoid this**: a per-node `CELLD_VARS_FILE` (dotenv-style path, read at build
+time) and the `CELLD_VAR_<NAME>` family, neither ever uploaded. celld now
+refuses to start if either is set (`crates/celld/env_vars.rs`, the
+`REMOVED`/`REMOVED_PREFIX` table), and `celld deploy`'s `Options.vars` doc
+comment confirms `celld deploy` itself reads no node-local override at all —
+"so a local credential cannot reach a fleet." There is currently no supported
+way to give a deployed fleet a value that isn't in the bucket manifest; fetch
+secrets from an external store at request time, or keep them at the ingress
+layer instead of as a Worker var.
 
 ## Ownership balancing
 
@@ -348,10 +346,9 @@ concurrent evictions) are **removed**.
 disables), `CELLD_ASSET_CACHE_DIR`, `CELLD_ASSET_CACHE_BYTES` (512 MiB).
 
 **Deploy / lease:** `CELLD_DEPLOY_POLL_S` (30), `CELLD_DEPLOY_MAX_AGE_S` (60),
-`CELLD_TTL_MS` (10000), `CELLD_VARS_FILE` / `CELLD_VAR_*` (per-node Worker var
-overrides, never uploaded to the bucket — see *Worker vars and secrets*).
-`CELLD_STORAGE_PROBE` is **removed** — the startup storage-contract test can no
-longer be skipped.
+`CELLD_TTL_MS` (10000). `CELLD_VARS_FILE` and `CELLD_VAR_*` are **removed** in
+v0.5.0 — see *Worker vars and secrets*. `CELLD_STORAGE_PROBE` is **removed** —
+the startup storage-contract test can no longer be skipped.
 
 **Recovery / shutdown:** `CELLD_RECOVERY_RETRY_MS` (1000),
 `CELLD_RECOVERY_RETRIES` (240), `CELLD_RELEASES` (128),
