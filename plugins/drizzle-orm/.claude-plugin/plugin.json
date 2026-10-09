@@ -1,7 +1,7 @@
 {
   "name": "drizzle-orm",
   "description": "Working with Drizzle ORM and Drizzle Kit — TypeScript schema declaration, the SQL-like and relational query APIs, migrations (generate/migrate/push/pull), driver setup, serverless performance, and the type/mapping pitfalls that bite in production.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Violet Buse",
     "email": "violet@git.violetbuse.com"

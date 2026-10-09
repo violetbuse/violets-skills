@@ -53,7 +53,7 @@ So:
   public docs, or the upstream GitHub repo (which Claude can `WebFetch`).
 - `vendor/` submodules exist purely so skill content can be written and verified
   against real upstream source. Pin them to a released tag and state that
-  version in the skill (e.g. the `celld` skill tracks celld **v0.4.1**,
+  version in the skill (e.g. the `celld` skill tracks celld **v0.6.2**,
   `vendor/celld`). Re-verify version-sensitive claims when bumping.
 - When upstream has no tags (a live docs site), pin to a dated commit and say so
   in the skill. The `drizzle-orm` skill tracks **`drizzle-orm` 0.45.2**
