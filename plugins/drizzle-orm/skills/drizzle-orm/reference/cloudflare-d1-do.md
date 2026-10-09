@@ -212,30 +212,25 @@ time, wrangler needs a text rule:
 "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
 ```
 
-> **celld does not support this.** As of celld v0.4.1 the `.sql`-as-Text-module
-> approach is blocked end to end:
-> - `rules` is not an accepted `wrangler.json` key — `celld deploy` (and `celld
->   dev`) abort on any unknown top-level key.
-> - celld's bundler runs esbuild with only `--loader:.wasm=copy`; esbuild has no
->   default `.sql` loader, so `import m0000 from "./0000_init.sql"` fails to
->   bundle.
-> - `no_bundle: true` + a real `wrangler` build doesn't help: celld uploads only
->   the single entry module, so wrangler's separate `.sql` Text modules are
->   dropped and the import is unresolved at runtime.
+> **On celld (v0.5.1+), drop `fallthrough`.** celld accepts `rules`, but a rule
+> may contain only `type` and `globs` — any other key, including
+> `fallthrough`, stops `celld deploy` / `celld dev` — and each glob must be
+> `**/*.ext` or `*.ext`. So use:
+> ```jsonc
+> // wrangler.jsonc — works on both Cloudflare and celld ≥ v0.5.1
+> "rules": [{ "type": "Text", "globs": ["**/*.sql"] }],
+> ```
+> (`no_bundle: true` can't be combined with `rules` on celld.)
 >
-> **Workaround on celld:** don't rely on the `.sql` imports. After `drizzle-kit
-> generate`, run a small codegen step that reads the `NNNN_*.sql` files and
-> rewrites `drizzle/migrations.js` (or a sibling `.ts`) with the SQL inlined as
-> string literals instead of `import` statements — e.g.
+> **celld ≤ v0.5.0** rejected `rules` entirely and bundled with only
+> `--loader:.wasm=copy`, so `import m0000 from "./0000_init.sql"` failed. On
+> those versions, add a codegen step after `drizzle-kit generate` that rewrites
+> `drizzle/migrations.js` with the SQL inlined as string literals:
 > ```js
 > import journal from "./meta/_journal.json";
 > const m0000 = `CREATE TABLE ...`;   // inlined from 0000_init.sql
 > export default { journal, migrations: { m0000 } };
 > ```
-> Then it's plain JS, esbuild bundles it normally, and no `rules` key is needed.
-> Feed the result to `migrate(this.db, migrations)` as usual. (A `CELLD_ESBUILD`
-> wrapper that appends `--loader:.sql=text` also works but leans on an
-> undocumented seam.)
 
 - **`push` / `pull` / `studio` don't work against a Durable Object** — there's
   no endpoint. Always `generate` + runtime `migrate()`.

@@ -1,10 +1,10 @@
 # Operating a celld fleet
 
-Distilled from celld v0.5.0: `docs/README.md`, `docs/security.md`,
+Distilled from celld v0.6.2: `docs/README.md`, `docs/security.md`,
 `docs/telemetry.md`, `docs/limitations.md`, and `crates/celld/main/cli.rs` in
 <https://github.com/denoland/celld> (fetch those, or run `celld --help`, for
-the primary text). celld is alpha — the operator API and `CELLD_*` defaults can
-change between releases; keep operator tooling and the binary on the same
+the primary text). celld v0.6.x is beta, but the operator API is still alpha —
+it and `CELLD_*` defaults can change between releases; keep operator tooling and the binary on the same
 release, and re-check anything version-sensitive against the project's release.
 
 ## The two listeners
@@ -41,11 +41,12 @@ Reachable on the internal listener. A release can change paths/formats.
 
 | Route | Effect |
 | --- | --- |
-| `GET /state` | Live counters: `owned_cells`, `occupied`, `capacity_waiting`, `activation_waiting`, `restoring`, `shedding`, `handed_off`, `rebalanced`, `rebalance_failed`, memory values, the deployment(s) served/draining, moving objects, and each resident object's deployment. `node_load` = the same sample the node lease publishes. |
-| `POST /reload` | Adopt `deploy/current.json` now; also rebuilds unchanged code (applies a `CELLD_VARS_FILE` edit). Response reports a build failure. |
+| `GET /state` | Live counters (see *Autoscaler signals*), the deployment(s) served/draining, moving objects, and each resident object's deployment. `node_load` = the same sample the node lease publishes. |
+| `POST /reload` | Adopt `deploy/current.json` now; also rebuilds unchanged code. Response reports a build failure. |
 | `POST /shutdown` | Start the graceful ownership handoff. `?handoff=preserve` prepares a same-node reload and keeps ownership records. |
 | `POST /rebalance/pause` / `POST /rebalance/resume` | Pause/resume ownership balancing. One paused lease pauses the **whole fleet**. |
-| `/cell/<SCOPE>`, `/evict/<SCOPE>`, `/do/<ID>` | Resolve/activate, evict a resident cell, direct request to an ordinary Durable Object. `/do/<ID>` refuses reserved runtime classes (D1, Workflows, KV, Queues) — those use the HMAC-authenticated `/runtime/<SCOPE>`. |
+| `/cell/<SCOPE>`, `/do/<ID>` | Resolve/activate a cell; direct request to an ordinary Durable Object. `/do/<ID>` refuses reserved runtime classes (D1, Workflows, KV, Queues) — those use the HMAC-authenticated `/runtime/<SCOPE>`. |
+| `/evict/<SCOPE>` | Try to evict a resident cell **and report the result** (since v0.5.1 — it used to return success before the eviction completed). 200 `{"ok":true}` = evicted or already locally absent. Otherwise `{"ok":false,"error":{"kind","reason"}}`: 409 `refused` (`cell_active`, `cell_transitioning`, `alarm_imminent`, `alarm_uncovered`), 503 `refused` (`node_unavailable`, `eviction_limit`), 409 `cancelled` (`new_activity`, `alarm_activity`, `node_fenced`), 500/503 `failed` (`reply_lost`, `durability_failed`, `durability_timeout`, `runtime_stop_failed`, `actor_unavailable`). An error doesn't prove the runtime is still resident; a later request can reactivate the cell before the response arrives. |
 | `GET /.well-known/celld/health` (public) | Boolean. 503 during a drain and before a joining node settles — gate rolling updates on it. Carries no utilization number. |
 
 Operators must not call `/peer/*` and other reserved peer paths directly.
@@ -66,7 +67,8 @@ hibernatable WebSockets are kept; the move touches no bucket.
 ## Worker vars and secrets
 
 celld has no encrypted secret store (no `wrangler secret`). `celld dev` reads
-a local `.dev.vars` file (`NAME=value` per line, quotes stripped) for
+a local `.dev.vars` file — or, without one, `.env` then `.env.local` (v0.6.2;
+`export` prefixes and multi-line quoted values allowed) — for
 developer convenience and turns each entry into a Worker var, overriding a
 same-named `vars` entry; only `celld dev` reads it, so it never reaches a
 deployed fleet. A deployed fleet's Worker vars (`plain_text` bindings, read as
@@ -151,12 +153,18 @@ celld does not scale itself. Two surfaces feed an external autoscaler:
   `resident_cells`, `host_websockets`, `rss_bytes`, `in_use_bytes`,
   `cpu_percent_x100`, `open_fds`, `pressured`, `memory_headroom`, `shed_cells`,
   `restoring`, `sampled_ms`. Readable with the bucket credentials alone.
-- **`GET /state`** on the internal listener — the live counters above, plus
-  (since v0.5.0) `remote_route_refreshes`: cached owner/capacity routes that
-  expired and triggered a fresh lookup. It rises during normal lease renewal
-  too (not just failures), so treat a spike relative to baseline, not the
-  absolute count, as the signal; an adoption with no prior lease and an
-  explicit invalidation don't count toward it.
+- **`GET /state`** on the internal listener:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `capacity_waiting` | Activations queued behind the residency cap — positive ⇒ add a node |
+  | `activation_waiting`, `restoring` | Cold activations waiting for / holding a permit |
+  | `owned_cells`, `occupied`, `shedding` | Ownership, residency, pressure shedding |
+  | `handed_off`, `rebalanced`, `rebalance_failed` | Cells given to peers, the part balancing moved, moves no peer took |
+  | `remote_route_refreshes` | Cached routes that expired and triggered a new lookup. Normal lease renewal raises it — watch spikes vs baseline |
+  | `allocator` (v0.5.1) | Rust allocator bytes (`allocated`/`resident`/`mapped`/`retained_bytes`); V8 heaps not included |
+  | `libc_malloc` (v0.5.1, Linux) | `in_use_bytes` / `free_bytes` of the C allocator SQLite and V8 use |
+  | `deployment.isolates`, `deployment.draining` (v0.5.1) | Per script (`cells`, `stateless`, `services`): `live`, `live_empty`, `retiring`, `freed`, `heap_bytes`, `external_bytes`. `live_empty` persisting > 30 s ⇒ isolate maintenance isn't running; persistent `retiring` ⇒ a turn/request still holds the heap |
 
 `capacity_waiting > 0` (or a `pressured` lease) is the direct "add a node"
 signal. Scale down only when every remaining node reports `memory_headroom` and
@@ -216,6 +224,10 @@ gate paces against fleet recovery.
 | v0.3.0 → v0.4.0 | **No** — stop all, then start all | v0.4.0 moves every proxied cell call onto one tunneled plain-HTTP connection and the peer protocol refuses a different version. It also stores large KV values under the ownership epoch with an epoch-qualified row reference a v0.3.0 node can't read — a mixed fleet can make a committed KV value unavailable. |
 | v0.4.0 → v0.4.1 | Yes, one at a time | v0.4.1 restores a large cell by paging; a paged epoch continues its predecessor's chain and a v0.4.0 node can't restore it. Each node publishes the bucket format it reads in its lease and only pages a takeover while every live lease reads that format; a mixed fleet clones like v0.4.0. Do not start a v0.4.0 binary after paging begins. |
 | v0.4.1 → v0.5.0 | **No** — stop all, then start all | v0.5.0 replaces the alarm-discovery/wake bucket layout (format 2 under `wake/entries/` + `wake/retired/`) and a v0.4.1 node can't read it. See *Alarm/wake-format migration* below — the upgrade requires a full stop, a backup, and revoking the old binaries' write access before restart. |
+| v0.5.0 → v0.5.1 | Yes, one at a time | Stop one node, wait for its replacement to report healthy, continue. |
+| v0.5.1 → v0.6.0 | **No with `fleet` durability** — stop all, then start all. `bucket` durability: rolling | A v0.6.0 node refuses to start against a v0.5.1 follower. v0.6.0 also gives each facet its own SQLite file + replication stream (v0.5.1 facets migrate on first open) and keeps empty R2 key segments. |
+| v0.6.0 → v0.6.1 | Yes, one at a time — **with feature gates** | Until every node runs v0.6.1: don't set `CELLD_LTX_RETENTION_SECS`, don't deploy a Python Worker, don't raise `CELLD_MAX_ASSET_FILE_BYTES` above 25 MiB. Rolling back to v0.6.0 can roll after unsetting `CELLD_LTX_RETENTION_SECS` on every node. |
+| v0.6.1 → v0.6.2 | Yes, one at a time | In a mixed pair, a handler failure on the owner of a forwarded DO fetch can reach the caller as a 500 response instead of a rejected `stub.fetch()`. Rollback to v0.6.1 can also roll. |
 | within a fleet, L1 compaction | — | `CELLD_LTX_COMPACTION=0` on every node of a mixed fleet until all can read v0.5.2 block objects — an old reader can't take a cell over after its first L1 publication. |
 
 ### Alarm/wake-format migration (v0.4.1 → v0.5.0)
@@ -244,12 +256,61 @@ unsupported data:
 Do not roll back by starting a v0.4.1 binary against an upgraded bucket —
 restore the pre-upgrade backup instead, which loses any writes made after it.
 
+## Bucket growth and epoch GC
+
+Each activation can add a new `cells/<cell>/ltx/e<epoch>/` prefix, and by
+default **nothing deletes old ones** — bucket usage grows with activations, not
+just data. v0.6.1 added opt-in epoch GC:
+
+- `CELLD_LTX_RETENTION_SECS` unset/`0` (default): no deletion. Positive: the
+  owner of an active cell deletes prefixes below the restore base, keeping its
+  own epoch, the previous one, and any epoch younger than this many seconds.
+  ≤1 pass per 5 minutes, ≤64 epochs per cell per pass. Runs under `fleet` and
+  (since v0.6.2) `bucket` durability.
+- Preview with `celld cell gc --dry-run [CLASS] --grace-secs N` (same listing
+  options as `cell list`): per cell, the deletable prefixes, their bytes, and
+  the restore base. Writes nothing; exits non-zero at the end if a cell
+  couldn't be read. Real deletion may come later or never (a cell must be
+  active and have written in this activation; a paged cell must be fully
+  hydrated; with `CELLD_LTX_COMPACTION=0` a fleet node waits for a handoff
+  snapshot).
+- Needs list-after-write consistency (not Tigris Global/Dual-region across
+  regions). Skips facet streams. Enable only once every node runs ≥v0.6.1.
+
+## R2 from the command line
+
+`celld r2 get|head|put|delete|list BUCKET [KEY]` (v0.5.1) works on the objects
+of an `r2_buckets` binding under `r2/<bucket_name>/` **directly in the fleet
+bucket — no running node needed**, so a release pipeline can upload an
+artifact before deploying. The first argument is the `bucket_name`, not the
+binding name.
+
+```sh
+celld r2 put assets app.zip --path dist/app.zip \
+  --content-type application/zip --metadata '{"release":"1.2.3"}' \
+  --bucket "$CELLD_BUCKET"
+```
+
+`put` needs exactly one of `--path FILE` / `--pipe`; `--metadata` (a flat JSON
+object of strings) becomes `customMetadata`, the content flags become
+`httpMetadata`. `get` streams to stdout; `head` prints the stored record
+(`--json` puts `httpMetadata`/`customMetadata` under `http`/`custom`). `list`
+prints ≤1000 keys plus the `--after KEY` continuation on stderr; `--all` for
+everything. Objects other tools put under the prefix are readable (without
+`cacheExpiry` or checksums). celld stores customMetadata/cacheExpiry/checksums
+as one JSON value under the `celld-r2` user-metadata name (`celld_r2` on
+Azure).
+
 ## Telemetry
 
 `CELLD_OTEL=1` (off by default, costs nothing off). Records a span per Worker
 request / cell event (fetch, alarm, RPC, WS message) / outbound `fetch()` /
 cell start, and a log record per `console.log` (carries the trace + span id,
-survives `await`). Reads W3C `traceparent` in, sends it out; a Worker→DO call
+survives `await`). Since v0.6.1 each log record carries the console method's
+OpenTelemetry severity in `severity_number` / `severity_text` (OTLP fields and
+Parquet columns): `debug` 5 `DEBUG`, `log`/`info` 9 `INFO`, `warn` 13 `WARN`,
+`error` 17 `ERROR`. Older log files lack these columns — read a mix with
+`union_by_name = true`. Reads W3C `traceparent` in, sends it out; a Worker→DO call
 stays one trace; a malformed header starts a new trace.
 
 | Var | Default | Effect |
@@ -269,7 +330,8 @@ the fleet bucket.
 Bucket sink layout: `telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`
 (logs under `telemetry/logs/...`). Schema `v0-unstable` — column names can
 change; the version is in each file's object metadata. No metrics yet (spans
-carry durations + queue waits). Query with DuckDB:
+carry durations + queue waits). The version is in object metadata `celld-schema`
+(`celld_schema` on `az://`). Query with DuckDB:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -278,6 +340,8 @@ CREATE SECRET celld_telemetry (TYPE s3, KEY_ID '...', SECRET '...',
 CREATE VIEW traces AS SELECT * FROM
   read_parquet('s3://YOUR-BUCKET/telemetry/traces/*/*/*/*/*/*.parquet');
 SELECT name, duration_us, trace_id FROM traces ORDER BY duration_us DESC LIMIT 20;
+-- error lines (logs view over telemetry/logs/... the same way)
+SELECT time_unix_us, body FROM logs WHERE severity_number >= 17;
 ```
 
 Run compaction on a maintenance node (not a celld node): rewrite each past
@@ -290,7 +354,8 @@ App-level details (config keys, `ctx.container`, fencing, package support) are
 in `SKILL.md`. Operationally:
 
 - Each node that serves a `containers` class needs its own Docker or Podman
-  daemon reachable at `DOCKER_HOST` or the engine's default socket. A node
+  daemon reachable at `DOCKER_HOST` (must be a `unix://` URL) or the default
+  socket of Docker, Docker Desktop, OrbStack, or Podman. A node
   without one refuses `start()` for that class but keeps serving every other
   class — there's no fleet-wide fallback.
 - `celld deploy` uploads each built/pulled image once to
@@ -307,6 +372,10 @@ in `SKILL.md`. Operationally:
 - A node stop destroys every container on it (disk included); plan container
   workloads around that the same way you'd plan around a Cloudflare container
   restart.
+- The node counts every running container's memory cap as committed memory
+  (the container cgroup is outside the node process), so a container-heavy
+  node reports no `memory_headroom` and sheds cells. Size node memory for the
+  largest instance type in use plus headroom.
 
 ## Environment variables (primary set)
 
@@ -334,10 +403,15 @@ variable takes its documented default.
 configured durability proof; celld rejects the variable, including `1` or an
 empty value.
 
-**Placement / capacity:** `CELLD_MAX_RESIDENT_CELLS`, `CELLD_IDLE_EVICT_S`,
+**Placement / capacity:** `CELLD_MAX_RESIDENT_CELLS`, `CELLD_IDLE_EVICT_S`
+(unset ⇒ only pressure or the residency cap evicts an idle cell),
 `CELLD_PLACEMENT_WEIGHT`, `CELLD_REBALANCE_INTERVAL_MS` (5000, `0` disables),
 `CELLD_PRESSURE_OWNERSHIP` (`release` / `sticky`), `CELLD_ACTIVATIONS`,
-`CELLD_MAX_CELL_REQUESTS` (64), `CELLD_MAX_REQUEST_BODY_BYTES` (1 GiB).
+`CELLD_MAX_CELL_REQUESTS` (64), `CELLD_MAX_REQUEST_BODY_BYTES` (1 GiB),
+`CELLD_MAX_ASSET_FILE_BYTES` (25 MiB per static-asset file, v0.6.1; must match
+on the deploying machine, the managed deployment agent, and every node; read
+once per process), `CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES` (64 MiB total
+Dynamic Worker module source, v0.6.1).
 `CELLD_REBALANCE_BATCH_CELLS` (fixed at 32) and `CELLD_EVICTIONS` (fixed at 4
 concurrent evictions) are **removed**.
 
@@ -361,7 +435,10 @@ never truncate; `0` disables), `CELLD_LTX_COMPACTION` (`1`; `0` on a mixed
 fleet until all nodes read block objects), `CELLD_LTX_COMPACTION_MIN_TXIDS`
 (256), `CELLD_LTX_COMPACTION_MIN_MB` (32, ≤64), `CELLD_LTX_COMPACTIONS` (2),
 `CELLD_LTX_PAGED` (`1`; `0` on a mixed fleet until all nodes run ≥v0.4.1),
-`CELLD_LTX_PAGED_MIN_MB` (256), `CELLD_LTX_HYDRATE_MBPS` (16). Each L1
+`CELLD_LTX_PAGED_MIN_MB` (256), `CELLD_LTX_HYDRATE_MBPS` (16; `0` keeps a
+paged cell sparse — and makes it ineligible for epoch GC),
+`CELLD_LTX_RETENTION_SECS` (unset ⇒ no epoch GC; see *Bucket growth and epoch
+GC*). Each L1
 compaction merges ≤256 source objects with a 64 MiB buffer budget, spilling to
 temporary files in the cell's local LTX directory for an oversized source.
 
@@ -377,7 +454,12 @@ proof per acknowledged write, and recovery reads both old per-cell objects and
 the new bundles.
 
 **Alarms / timers:** `CELLD_ALARM_RESIDENT_MS`, `CELLD_WAKER_TICK_MS`,
-`CELLD_FETCH_TIMEOUT_S`, `CELLD_HANDLER_BUDGET_S`, `CELLD_TOKIO_THREADS`.
+`CELLD_FETCH_TIMEOUT_S`, `CELLD_HANDLER_BUDGET_S`, `CELLD_TOKIO_THREADS`
+(default CPU count; the `host_runtime` startup log reports `worker_count`).
+
+**Python Workers (build side):** `CELLD_PYTHON_RUNTIME_DIR` (Pyodide runtime
+cache; default `$XDG_CACHE_HOME/celld/pyodide-0.28.3` or
+`~/.cache/celld/pyodide-0.28.3`).
 
 **Containers (experimental):** `CELLD_DOCKER` (engine CLI, default `docker`),
 `CELLD_CONTAINER_PLATFORM` (build target for `celld deploy`, default
@@ -387,12 +469,14 @@ the new bundles.
 runtime; `1.1.1.1` is always included). See *Containers* above.
 
 `CELLD_WORKER_LOADER`, `CELLD_MAX_LOADED_WORKERS`, `CELLD_AI_BINDING`, and
-`CELLD_AI_URL` are **removed**. Declare a Worker Loader with the
+`CELLD_AI_URL` are **removed**, as are `CELLD_CLOUD_RESTART_ON_DEPLOY` (a
+managed deployment adopts code in place) and `CELLD_PRESENCE_SHADOW` (use
+`celld diagnose --read-only` to check leases). Declare a Worker Loader with the
 `worker_loaders` config key in `wrangler.json` instead of an env var — Dynamic
 Workers is no longer experimental. The `env.AI` HTTP adapter is gone entirely;
 call an AI provider directly from application code.
 
-## Fleet limitations (alpha)
+## Fleet limitations (beta)
 
 - One application per fleet — no account service, multi-tenant scheduler, or
   managed ingress. Not safe for hostile multi-tenant use.

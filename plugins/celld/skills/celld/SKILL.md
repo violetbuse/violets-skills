@@ -7,10 +7,12 @@ description: >-
   wrangler.json, with durable state in an S3/GCS/Azure bucket you own. Use when
   writing or deploying a Worker/Durable Object app to celld, running or
   operating a celld fleet, using the `celld` CLI (`dev`, `deploy`, `diagnose`,
-  `cell`, `d1`, `kv`, `queue`), choosing bucket storage, tuning `CELLD_*`
-  environment variables, passing secrets or Worker vars without writing them to
-  the bucket, planning a version upgrade, or reasoning about celld's
-  one-writer / RPO=0 durability guarantees.
+  `cell list`, `cell gc`, `d1`, `kv`, `queue`, `r2`), deploying a Python
+  Worker or a Dynamic Worker (Worker Loader) to celld, choosing bucket storage,
+  controlling bucket growth with epoch GC, tuning `CELLD_*` environment
+  variables, passing secrets or Worker vars without writing them to the bucket,
+  planning a version upgrade, or reasoning about celld's one-writer / RPO=0
+  durability guarantees.
 ---
 
 # celld
@@ -24,18 +26,21 @@ service.
 
 - Upstream: <https://github.com/denoland/celld> · docs <https://celld.dev/docs>
   (the docs site is generated from the repo's `docs/` folder — same content).
-- **This skill reflects celld v0.5.0** (tagged 2026-09-15). celld is **alpha**:
-  APIs, the operator API, and `CELLD_*` defaults can change between releases.
-  Keep operator tooling and the celld binary on the same release — if the
-  project is on a different version, verify anything version-sensitive against
-  that release's docs.
+- **This skill reflects celld v0.6.2** (tagged 2026-10-07). celld calls v0.6.x
+  a **beta** release (it was alpha through v0.5.x); the internal operator API
+  is still explicitly **alpha**, and `CELLD_*` defaults can still change
+  between releases. Only the latest release gets security fixes. Keep operator
+  tooling and the celld binary on the same release — if the project is on a
+  different version, verify anything version-sensitive against that release's
+  docs.
 - **This skill is self-contained** — `SKILL.md` plus `reference/architecture.md`,
   `reference/operations.md`, `reference/cloudflare-compat.md`. For anything
   deeper, go to the source: `celld --help` on the installed binary, the docs at
   the link above (or fetch `docs/*.md` from the GitHub repo), and in the repo
   itself `crates/celld/protocol.rs` (bucket-contract types),
-  `crates/celld/main/cli.rs` (full CLI help), and `examples/*` (one runnable
-  Wrangler project per service). If you happen to be working inside the
+  `crates/celld/main/cli.rs` (full CLI help), `docs/services/*.md` (one page
+  per service, each with its Cloudflare differences), and `examples/*` (one
+  runnable Wrangler project per service). If you happen to be working inside the
   `violets-skills` repo, a checkout is vendored at `vendor/celld/`; that path
   does **not** exist where this plugin is installed.
 
@@ -61,10 +66,21 @@ unless renewed, so a dead machine releases its cells with no failure detector.
 Replicated SQLite data is written under `cells/<cell>/ltx/e<epoch>/`, so a node
 that lost ownership writes only into a superseded prefix.
 
+**Bucket growth:** each activation can add a new epoch prefix, and by default
+celld **deletes none of them** — a cell's bucket bytes grow with every
+activation. Set `CELLD_LTX_RETENTION_SECS` (v0.6.1+, every node on ≥v0.6.1
+first) to enable **epoch GC**: the owner deletes prefixes no restore reads,
+keeping its own epoch, the one before, and anything younger than the grace.
+Preview it with `celld cell gc --dry-run`. Epoch GC needs list-after-write
+consistency (don't enable it on a multi-region Tigris Global/Dual-region
+bucket) and skips facet streams.
+
 **Durability (RPO=0):** celld never acknowledges a write until it survives a
 failure. `CELLD_DURABILITY=fleet` (the default): the owner streams each write
 to one or two follower nodes and acks once they've `fsync`'d it (a lab fleet
-measured ~25 ms), uploading to the bucket afterward. **A single node has no
+measured ~25 ms) or the bucket upload finishes, whichever comes first. A node
+with only one follower recruits a second as soon as another node is available
+(v0.6.2). **A single node has no
 follower**, so every write waits for a bucket round trip (~90 ms region-local,
 ~600 ms otherwise) — run **2+ nodes if write latency matters**. `bucket` mode
 always waits for the bucket. There is no setting to skip the durability wait —
@@ -103,12 +119,17 @@ celld dev --no-watch      # disable auto rebuild/restart on file changes
   the operator subcommands **cannot** use this local backend.
 - State lives in `.celld/dev` under the project and **survives restarts**. Add
   `.celld/` to the app's `.gitignore`.
-- Reads a `.dev.vars` file beside the Wrangler config, as `wrangler dev` does:
-  `NAME=value` per line, quotes stripped, no other dotenv features. Each entry
-  becomes a Worker var and overrides a same-named entry in `vars`. Only `celld
-  dev` reads it — `celld deploy` never does, so a local credential doesn't
-  reach a fleet. Add `.dev.vars` to `.gitignore`; editing it rebuilds the app
-  with no restart.
+- Reads a `.dev.vars` file beside the Wrangler config, as `wrangler dev` does;
+  **without `.dev.vars` it reads `.env`, then `.env.local`** (which overrides
+  `.env`) — v0.6.2. Each `NAME=value` entry becomes a Worker var and overrides
+  a same-named entry in `vars`. Lines may start with `export`, and a quoted
+  value may span lines (e.g. a PEM key); trailing comments and `${VAR}`
+  references are not supported. An entry that isn't a valid binding name (or
+  collides with another binding) is skipped with a warning in `.env` files but
+  **stops the build** in `.dev.vars`. Only `celld dev` reads these files —
+  `celld deploy` never does, so a local credential doesn't reach a fleet. Add
+  `.dev.vars`, `.env`, `.env.local` to `.gitignore`; editing one rebuilds the
+  app with no restart.
 - **Gotcha:** `celld dev` does **not** migrate persisted state across a config
   change. An object can keep a value the new config rejects, and the resulting
   error names the stored value, not the config — looks unrelated to the change.
@@ -138,8 +159,7 @@ celld deploy . --json
   (`CELLD_DEPLOY_POLL_S`) and adopts the new deployment in place; `POST
   /reload` on the internal listener adopts it now. A build failure leaves the
   current deployment serving and is reported in the log and the `/reload`
-  response. `POST /reload` also rebuilds unchanged code, so a `CELLD_VARS_FILE`
-  edit applies without a restart.
+  response. `POST /reload` also rebuilds unchanged code.
 - A resident Durable Object moves to new code at a safe point (no request /
   alarm running, no output awaiting durability, no regular WebSocket open).
   Objects that reach no safe point within `CELLD_DEPLOY_MAX_AGE_S` (default 60)
@@ -148,7 +168,10 @@ celld deploy . --json
   one deployment can call a Durable Object on the other, so **two adjacent
   versions must accept each other's calls**.
 - Worker code needs `esbuild` on `PATH`. An unknown key in the Wrangler config
-  stops the deploy. See `reference/cloudflare-compat.md` for the accepted
+  stops the deploy. Since v0.5.1, Wrangler's `define` and module `rules`
+  (`Text` / `Data` / `CompiledWasm`, globs of the form `**/*.ext` or `*.ext`
+  only, no `fallthrough` key) are accepted, so e.g. `.sql` / `.txt` imports
+  as Text modules work. See `reference/cloudflare-compat.md` for the accepted
   config subset and every service gap.
 
 ## Run a node
@@ -186,17 +209,19 @@ celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION" 
   `CELLD_WATCH`, pass the AWS credential env through, expose 8080 via the LB,
   keep 8081 private.
 - Installer: `curl -fsSL https://celld.dev/install.sh | sh` (pin with
-  `CELLD_VERSION=v0.5.0`; verify with `gh attestation verify <asset> --repo
+  `CELLD_VERSION=v0.6.2`; verify with `gh attestation verify <asset> --repo
   denoland/celld`).
 
 ## Operator CLI
 
 All operator subcommands take the shared fleet flags (`--bucket`,
-`--endpoint`, `--region`, or `CELLD_BUCKET` / `S3_ENDPOINT` / `AWS_REGION`) and
-need a **running fleet** — they find a node via bucket leases and sign requests
-with the fleet secret read from the bucket. Data goes to stdout, messages to
-stderr. Listings are bounded to 1000 rows; continue with `--after CURSOR` or
-read everything with `--all`; `--json` gives one object per line.
+`--endpoint`, `--region`, or `CELLD_BUCKET` / `S3_ENDPOINT` / `AWS_REGION`).
+`d1`, `kv`, `queue`, and `diagnose` need a **running fleet** — they find a
+node via bucket leases and sign requests with the fleet secret read from the
+bucket; `r2` and `cell` read the bucket directly. Data goes to stdout,
+messages to stderr (a closed stdout pipe is a clean stop). Listings are
+bounded to 1000 rows; continue with `--after CURSOR` or read everything with
+`--all`; `--json` gives one object per line.
 
 | Command | Purpose |
 | --- | --- |
@@ -205,13 +230,15 @@ read everything with `--all`; `--json` gives one object per line.
 | `celld d1 execute\|migrations apply\|migrations list DB` | Run SQL / migrations against a deployed D1 database. `DB` is a `database_name` from `d1_databases`. Migration files are `NNNN_description.sql` in `migrations/` (`.sql` case-insensitive). |
 | `celld kv get\|put\|delete\|list\|info NS` + `celld kv bulk get\|put\|delete` | Read/write a deployed KV namespace. `NS` is the `id` from `kv_namespaces`, verbatim. Bulk uses Wrangler's file format, so `wrangler kv bulk get` exports straight into `celld kv bulk put`. |
 | `celld queue info\|peek\|purge\|pause\|resume\|redrive QUEUE` | Inspect/control a deployed Queue. `pause` stops delivery while producers keep sending; `purge` needs `--force`. |
+| `celld r2 get\|head\|put\|delete\|list BUCKET [KEY]` | (v0.5.1+) Read/write the objects behind an `r2_buckets` binding — replaces `wrangler r2 object`. `BUCKET` is the `bucket_name`, not the binding name. **Needs no running node**, so a release pipeline can publish an artifact before deploying. `put` takes `--path FILE` or `--pipe`, plus `--content-type` etc. (→ `httpMetadata`) and `--metadata '{"k":"v"}'` (→ `customMetadata`). |
+| `celld cell gc --dry-run [CLASS]` | (v0.6.1+) Per cell, list the superseded epoch prefixes epoch GC could delete, their bytes, and the restore base. Writes nothing; `--grace-secs N` sets the preview grace. Real deletion happens only on nodes with `CELLD_LTX_RETENTION_SECS` set. |
 
 Managed control plane subcommands also exist (`celld connect`, `credentials`,
 `token`, `disconnect`) for connecting an installation to celld.dev's Managed
 Control Plane.
 
 See `reference/operations.md` for fleet operation in depth: the internal
-operator API (`/state`, `/reload`, `/shutdown`, `/rebalance/pause`), autoscaler
+operator API (`/state`, `/reload`, `/shutdown`, `/evict`, `/rebalance/pause`), autoscaler
 signals, ownership balancing, memory-pressure shedding, graceful shutdown /
 rollout, and the per-version upgrade exceptions (several upgrades are **not**
 rolling-safe).
@@ -257,32 +284,46 @@ Example projects (`examples/<name>/` in the celld repo): `hello` (stateless fetc
 `webapi`, `counter` / `router` / `async` (Durable Object + SQLite storage),
 `rpc` (JS RPC via `getByName`), `wsecho` (hibernating WebSocket),
 `wsclient` (outbound WebSocket from a DO), `alarm`, `cron`, `d1`, `kv`, `r2`,
-`workflow`, `vectordb` (`sqlite_vec` flag), `wasm` (Rust via workers-rs),
-`facets` (Worker Loader + a facet class), `container` / `sandbox` (Cloudflare
-Sandbox SDK on a container), `pi` / `opencode` (agent loops in a DO).
+`workflow`, `queues` (producer + consumer + dead-letter queue),
+`static-assets` (`_headers`/`_redirects`, no Worker), `vectordb` (`sqlite_vec`
+flag), `wasm` (Rust via workers-rs), `facets` (Worker Loader + a facet class),
+`dynamic-worker-tails` (Worker Loader + Tail Worker), `python` (Python
+Worker), `container` / `sandbox` (Cloudflare Sandbox SDK on a container),
+`pi` / `opencode` (agent loops in a DO).
+
+Two behaviors that now match workerd and can break code that worked on older
+celld: every export of the main module must be a handler object or a class
+(`export const X = "..."` fails the Worker's start, v0.6.0), and returning a
+WebSocket response to a request without `Upgrade: websocket` fails with a
+`TypeError` / HTTP 500 (v0.6.2).
 
 **Compatibility highlights** (full list + every gap in
 `reference/cloudflare-compat.md`):
 
 - **Yes:** Workers, Durable Objects (SQLite storage, alarms, hibernating
-  WebSockets, Facets), static assets (`_headers`/`_redirects`, no edge
+  WebSockets, Facets — each facet with its own replicated SQLite stream since
+  v0.6.0), static assets (`_headers`/`_redirects`, no edge
   cache/compression), Cron Triggers, Dynamic Workers (Worker Loader, declared
-  with the `worker_loaders` config key — no env var), KV, Queues, D1,
-  Workflows, R2. Most runtime APIs — fetch, streams, WebSockets, Web Crypto,
-  WebAssembly (including `no_bundle` prebuilt deployments), HTMLRewriter, TCP
-  sockets.
+  with the `worker_loaders` config key — no env var; `limits` and `tails` in
+  `WorkerCode` supported since v0.5.1), KV, Queues, D1, Workflows, R2. Most
+  runtime APIs — fetch, streams, WebSockets, Web Crypto (incl. Ed25519 /
+  X25519 since v0.6.0), WebAssembly (including `no_bundle` prebuilt
+  deployments), HTMLRewriter, TCP sockets.
 - **Experimental (opt-in):** Containers (the `containers` config key; needs a
   Docker/Podman daemon on every node that serves the class — see
   *Containers*), including `@cloudflare/containers` and the Cloudflare
   Sandbox SDK.
 - **No:** Workers AI (no binding, no HTTP adapter — call the provider
-  directly), Vectorize, Hyperdrive, Browser Rendering, Email Workers, Python
-  Workers, BroadcastChannel, `tail`/`email` handlers.
-- **Partial:** Node.js compat (a fixed module set), Cache API (always-miss).
-- **Key differences:** no TLS termination (do it at ingress); SQLite `TEXT`
-  rejects invalid UTF-8 (use `BLOB`); one writer per KV namespace and per
-  queue (add more to scale writes); `wrangler.toml` is not accepted — use
-  `wrangler.jsonc` / `wrangler.json`; unknown top-level config keys
+  directly), Vectorize, Hyperdrive, Browser Rendering, Email Workers,
+  BroadcastChannel, `tail`/`email` handlers.
+- **Partial:** Python Workers (v0.6.1+: `fetch` handlers only, Pyodide 0.28 —
+  see *Python Workers* below), Node.js compat (a fixed module set), Cache API
+  (always-miss).
+- **Key differences:** no TLS termination (do it at ingress); invalid UTF-8 in
+  SQLite `TEXT` decodes as U+FFFD (since v0.6.0 — it used to error; store
+  arbitrary bytes as `BLOB`); one writer per KV namespace, per queue, and per
+  D1 database (add more to scale writes); `wrangler.toml` is not accepted —
+  use `wrangler.jsonc` / `wrangler.json`; unknown top-level config keys
   (incl. `routes`) stop the deploy.
 - **Hot-cell overload:** a cell admits 64 concurrent fetch events
   (`CELLD_MAX_CELL_REQUESTS`); excess gets HTTP 503 + `Retry-After: 1` +
@@ -319,13 +360,50 @@ the shared node sample, so two nodes starting at once can briefly exceed it.
   snapshots, or outbound interception. `@cloudflare/containers` and
   `@cloudflare/sandbox` (on the `cloudflare/sandbox` image) run as published —
   see `examples/container` / `examples/sandbox`.
+- `instance_type` takes `lite` (old name `dev`, the default: 1/16 CPU,
+  256 MiB), `basic`, `standard-1` (alias `standard`) … `standard-4`. The node
+  counts each running container's memory cap as committed memory, so a
+  container-heavy node reports no headroom and sheds cells — size node memory
+  for the largest instance type plus headroom.
 - Config keys, `ctx.container`, and the security boundary can change without
   notice — this feature is explicitly experimental, not just opt-in.
+
+## Python Workers (partial, v0.6.1+)
+
+A Worker whose `main` is a `.py` file uses the Cloudflare Python Workers API
+(`from workers import WorkerEntrypoint, Response`); the same project runs on
+Cloudflare. celld runs **Pyodide 0.28.3 / CPython 3.13.2** (`pyodide_2025_0`
+wheel ABI).
+
+- Build: `uv run pywrangler sync` (vendors packages into `python_modules/`),
+  then `celld dev .` / `celld deploy .`. The deploy bundles the Pyodide
+  runtime, `python_modules/`, and `.py`/`.txt`/`.html`/`.sql`/`.bin`/`.wasm`
+  files below `main`'s directory — nothing downloads at run time. The first
+  build fetches Pyodide into `~/.cache/celld/pyodide-0.28.3`
+  (`CELLD_PYTHON_RUNTIME_DIR` overrides; a populated dir allows offline
+  builds). Still needs `esbuild`.
+- Config: `compatibility_flags` must include `python_workers`;
+  `compatibility_date` must be ≥ 2026-04-21 (or add the flags that date
+  implies) and **before 2026-09-08** unless you add `no_python_workers_314` —
+  from that date Cloudflare runs Python 3.14, which celld doesn't.
+- Supported: `Default(WorkerEntrypoint).fetch`, `workers.Response` /
+  `workers.fetch`, `self.env` bindings (tested with KV), `self.ctx.waitUntil`,
+  pure-Python packages, `from js import ...`.
+- **Not supported:** Durable Objects, Workflows, Cron, or Queue consumers in
+  Python (deploy refuses them — keep those in JS), named entrypoints / RPC to
+  Python, packages with compiled extensions (`.so`), `ssl` / `sqlite3` /
+  `lzma` / OpenSSL `hashlib` algorithms, `pyodide.ffi.run_sync`, memory
+  snapshots (so sync FastAPI handlers don't work).
+- **Upgrade every node to ≥v0.6.1 before the first Python deployment.** The
+  deployment needs the `python-workers-v1` feature but `celld deploy` doesn't
+  check nodes: an older running node keeps serving its previous deployment
+  (the fleet then serves two versions) and an older node that starts while a
+  Python deployment is current exits.
 
 ## Secrets and Worker vars
 
 celld has **no encrypted secret store** — nothing like `wrangler secret put`.
-`celld dev` reads a local `.dev.vars` file for convenience (see *Develop
+`celld dev` reads a local `.dev.vars` (or `.env` / `.env.local`) file for convenience (see *Develop
 locally*), but a deployed fleet has no equivalent — `celld deploy` never reads
 it. A deployed Worker's **vars** (`plain_text` bindings, read as `env.NAME`)
 come from exactly one source, resolved on each node when it builds a
@@ -399,18 +477,24 @@ sink switch. Reads W3C `traceparent`. Details + DuckDB queries in
 - **`celld dev` state is not migrated** across config changes; errors point at
   the stored value, not the config. Use `--clean`.
 - **Some version upgrades are not rolling-safe** (v0.1→v0.2, v0.3→v0.4,
-  **v0.4.1→v0.5.0**). The v0.5.0 upgrade needs a full fleet stop for a new
-  alarm/wake-format migration — check `reference/operations.md` before
-  upgrading a fleet.
+  v0.4.1→v0.5.0, and **v0.5.1→v0.6.0 with `fleet` durability** — a v0.6.0
+  node refuses a v0.5.1 follower). Others are rolling but gate features until
+  every node is upgraded (v0.6.0→v0.6.1: don't set
+  `CELLD_LTX_RETENTION_SECS`, deploy a Python Worker, or raise
+  `CELLD_MAX_ASSET_FILE_BYTES` above 25 MiB until all nodes run v0.6.1). Check
+  `reference/operations.md` before upgrading a fleet.
+- **Bucket usage grows with every activation** unless
+  `CELLD_LTX_RETENTION_SECS` enables epoch GC (off by default).
 - **The internal listener is unauthenticated** for most operator routes and has
   no TLS — a trusted private network is mandatory.
 - **`wrangler.toml` and `routes` are rejected.** Convert config to JSON and
-  configure routing in your ingress.
+  configure routing in your ingress. (`define` and `rules` are accepted since
+  v0.5.1, but a rule with `fallthrough` or a non-`**/*.ext` glob is refused.)
 - **Bucket credentials = full fleet control.** Scope each credential to one
   fleet bucket.
 - **`wrangler.json` `vars` go to the bucket in the clear** and stay in every
   past deployment version. celld has no secret store, and as of v0.5.0 no
   per-node override either (`CELLD_VARS_FILE`/`CELLD_VAR_*` were removed) — see
   *Secrets and Worker vars*.
-- celld is **alpha**: pin `CELLD_VERSION`, keep operator tooling and binary on
-  the same release, expect `CELLD_*` defaults to shift.
+- celld is **beta** (operator API alpha): pin `CELLD_VERSION`, keep operator
+  tooling and binary on the same release, expect `CELLD_*` defaults to shift.
